@@ -1,0 +1,147 @@
+// Find DSUIInstallMenuDataSourceResource singleton in DS2.exe heap.
+// Identification: 7 consecutive Array<X*> headers at +0x20..+0x80 where
+// data[0] of each is a heap pointer. Final validation: walk
+// MusicJacketImageTextures[0]'s UITexture chain (UITex+8 -> A+18 -> B+0
+// -> C+8..+48) and check the resulting D3D12 ptrs all live in heap memory.
+//
+// Once found, dump every music jacket dst pointer to
+//   <game>\albumjacket\music_jacket_dsts.txt
+// The ASI watches this file and uses its content as the music-jacket set
+// for CTR substitution filtering.
+
+const ds2 = Process.findModuleByName('DS2.exe');
+console.log('DS2 base=' + ds2.base + ' size=0x' + ds2.size.toString(16));
+
+const OUT_PATH = ds2.path.substring(0, ds2.path.lastIndexOf('\\')) +
+    '\\albumjacket\\music_jacket_dsts.txt';
+console.log('Will write to:', OUT_PATH);
+
+function isHeapPtr(p) {
+    if (!p || p.isNull()) return false;
+    const hi = p.shr(40).toUInt32();
+    if (hi < 1 || hi > 7) return false;
+    if (p.and(7).toUInt32() !== 0) return false;
+    return true;
+}
+
+function readArr(addr) {
+    try {
+        const count = addr.readU32();
+        const cap = addr.add(4).readU32();
+        if (count === 0 || count > 200 || cap < count || cap > 1024) return null;
+        const data = addr.add(8).readPointer();
+        if (!isHeapPtr(data)) return null;
+        const first = data.readPointer();
+        if (!isHeapPtr(first)) return null;
+        return { count, cap, data, first };
+    } catch (e) { return null; }
+}
+
+function walkUITexToD3D12(uitex) {
+    try {
+        const A = uitex.add(0x08).readPointer();
+        if (!isHeapPtr(A)) return null;
+        const B = A.add(0x18).readPointer();
+        if (!isHeapPtr(B)) return null;
+        const C = B.readPointer();
+        if (!isHeapPtr(C)) return null;
+        const out = [];
+        for (let i = 0; i < 9; i++) {
+            try {
+                const o = C.add(0x08 + i * 8).readPointer();
+                if (isHeapPtr(o)) out.push(o);
+            } catch (e) {}
+        }
+        return out;
+    } catch (e) { return null; }
+}
+
+const ranges = Process.enumerateRanges({ protection: 'rw-', coalesce: false })
+    .filter(r => {
+        const hi = r.base.shr(40).toUInt32();
+        return r.size >= 0x10000 && r.size <= 0x4000000 && hi >= 1 && hi <= 7;
+    });
+console.log('eligible heap ranges:', ranges.length);
+
+let candidates = [];
+let scanned = 0;
+
+// Scan ALL ranges. Early-finalize only if we already have a candidate with
+// arr60.count >= 30 (real InstallMenu has ~58 music jackets).
+function hasGoodCand() {
+    for (const c of candidates) if (c.arr60.count >= 30) return true;
+    return false;
+}
+function processRange(idx) {
+    if (idx >= ranges.length || hasGoodCand()) { finalize(); return; }
+    if ((idx % 100) === 0) {
+        console.log('  scan progress', idx, '/', ranges.length,
+            'cands=' + candidates.length);
+    }
+    const r = ranges[idx];
+    try {
+        let off = 0;
+        while (off + 0x100 < r.size) {
+            const candidate = r.base.add(off);
+            let allArrs = true;
+            for (let i = 0; i < 7; i++) {
+                if (!readArr(candidate.add(0x20 + i * 0x10))) {
+                    allArrs = false; break;
+                }
+            }
+            if (allArrs) {
+                // validate +0x60[0] -> UITex chain -> at least 1 D3D12 ptr
+                const arr60 = readArr(candidate.add(0x60));
+                if (arr60) {
+                    const d3ds = walkUITexToD3D12(arr60.first);
+                    if (d3ds && d3ds.length > 0) {
+                        candidates.push({ obj: candidate, arr60: arr60, d3ds: d3ds });
+                    }
+                }
+            }
+            off += 0x10;
+            scanned++;
+        }
+    } catch (e) {}
+    setImmediate(() => processRange(idx + 1));
+}
+
+function finalize() {
+    console.log('=== scan complete: ' + candidates.length + ' candidates ===');
+    if (candidates.length === 0) {
+        console.log('NO CANDIDATES - signature not matching anything');
+        return;
+    }
+    // Pick the candidate whose +0x60 array has the most D3D12 ptrs reachable.
+    candidates.sort((a, b) => b.arr60.count - a.arr60.count);
+    const best = candidates[0];
+    console.log('BEST candidate @', best.obj,
+        'count=' + best.arr60.count, 'cap=' + best.arr60.cap);
+
+    // Walk every UITexture in MusicJacketImageTextures and collect D3D12 dsts.
+    const dsts = new Set();
+    for (let i = 0; i < best.arr60.count; i++) {
+        try {
+            const uitex = best.arr60.data.add(i * 8).readPointer();
+            if (!isHeapPtr(uitex)) continue;
+            const d3ds = walkUITexToD3D12(uitex);
+            if (d3ds) for (const d of d3ds) dsts.add(d.toString());
+        } catch (e) {}
+    }
+    console.log('total unique D3D12 dst ptrs:', dsts.size);
+
+    // Write to file via Frida's File API.
+    try {
+        const f = new File(OUT_PATH, 'w');
+        f.write('# generated by find_jacket_dsts.js\n');
+        f.write('# InstallMenu @ ' + best.obj + '\n');
+        f.write('# count=' + best.arr60.count + ' unique=' + dsts.size + '\n');
+        for (const d of dsts) f.write(d + '\n');
+        f.close();
+        console.log('wrote ' + dsts.size + ' addrs to ' + OUT_PATH);
+    } catch (e) {
+        console.log('write failed:', e);
+    }
+}
+
+processRange(0);

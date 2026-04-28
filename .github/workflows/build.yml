@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Pinned Ultimate ASI Loader release. Bumped manually when we want a
+# newer one - latest tags listed at
+# https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases
+env:
+  UAL_TAG: v9.7.1
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build MinHook objects
+        shell: cmd
+        run: |
+          cl /nologo /O2 /MD /I"vendor\minhook\include" /c "vendor\minhook\src\hook.c"          /Fo:mh_hook.obj
+          cl /nologo /O2 /MD /I"vendor\minhook\include" /c "vendor\minhook\src\buffer.c"        /Fo:mh_buffer.obj
+          cl /nologo /O2 /MD /I"vendor\minhook\include" /c "vendor\minhook\src\trampoline.c"   /Fo:mh_trampoline.obj
+          cl /nologo /O2 /MD /I"vendor\minhook\include" /c "vendor\minhook\src\hde\hde64.c"    /Fo:mh_hde64.obj
+
+      - name: Compile ds2_musicplayer
+        shell: cmd
+        run: |
+          cl /nologo /O2 /std:c++17 /EHsc /MD /I"vendor\minhook\include" /I"vendor\single_header" /c src\ds2_musicplayer.cpp /Fo:ds2_musicplayer.obj
+
+      - name: Link
+        shell: cmd
+        run: |
+          link /nologo /DLL /OUT:ds2_musicplayer.asi ds2_musicplayer.obj mh_hook.obj mh_buffer.obj mh_trampoline.obj mh_hde64.obj kernel32.lib user32.lib
+
+      - name: Compute short SHA
+        id: sha
+        shell: bash
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Bundle Ultimate ASI Loader (${{ env.UAL_TAG }})
+        shell: bash
+        run: |
+          set -e
+          mkdir -p release_bundle
+          cp ds2_musicplayer.asi release_bundle/
+          # UAL ships its binary as dinput8.dll. The same binary works as
+          # any proxy filename via export forwarding -- DS2 imports
+          # version.dll, so we rename on extraction.
+          curl -fsSL -o ual.zip "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/${UAL_TAG}/Ultimate-ASI-Loader_x64.zip"
+          unzip -j -o ual.zip "dinput8.dll" -d release_bundle/
+          mv release_bundle/dinput8.dll release_bundle/version.dll
+          curl -fsSL -o release_bundle/LICENSE-Ultimate-ASI-Loader.txt "https://raw.githubusercontent.com/ThirteenAG/Ultimate-ASI-Loader/${UAL_TAG}/license"
+          echo "Ultimate ASI Loader ${UAL_TAG} bundled. Files in release_bundle/:" >&2
+          ls -la release_bundle/ >&2
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds2_musicplayer-${{ steps.sha.outputs.short }}
+          path: release_bundle/
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,41 @@
+# build artifacts
+*.obj
+*.asi
+*.exe
+*.lib
+*.exp
+*.pdb
+*.idb
+*.ilk
+release_bundle/
+
+# logs
+*.log
+ds2_musicplayer.*.log
+
+# user-specific test data
+albumjacket/
+sd_music/
+
+# editor
+.vscode/
+.vs/
+*.swp
+*~
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# binja / debug artifacts
+DS2.exe.bndb
+ds2_jacket_dump/
+*.dds
+*.bin
+
+# private session memory (personal notes, not for the repo)
+memory.md
+
+# claude artifacts
+.claude/
