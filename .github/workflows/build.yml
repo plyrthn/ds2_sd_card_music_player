@@ -3,6 +3,10 @@ name: build
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'vendor/**'
+      - 'do_build.bat'
   pull_request:
     branches: [main]
   workflow_dispatch:
