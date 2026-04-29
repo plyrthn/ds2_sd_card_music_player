@@ -75,18 +75,19 @@ jobs:
 
       - name: Zip release bundle
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        shell: bash
+        shell: pwsh
         run: |
-          cd release_bundle
-          zip ../ds2_musicplayer-${{ steps.sha.outputs.short }}.zip *
+          $name = "ds2_musicplayer-${{ steps.sha.outputs.short }}"
+          Compress-Archive -Path release_bundle/* -DestinationPath "$name.zip"
 
       - name: Publish release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
+        shell: pwsh
         run: |
-          gh release create "${{ steps.sha.outputs.short }}" \
-            --title "${{ steps.sha.outputs.short }}" \
-            --notes "Built from commit ${{ steps.sha.outputs.short }}." \
-            "ds2_musicplayer-${{ steps.sha.outputs.short }}.zip"
+          $name = "ds2_musicplayer-${{ steps.sha.outputs.short }}"
+          gh release create "${{ steps.sha.outputs.short }}" `
+            --title "${{ steps.sha.outputs.short }}" `
+            --notes "Built from commit ${{ steps.sha.outputs.short }}." `
+            "$name.zip"
