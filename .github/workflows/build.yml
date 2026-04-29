@@ -13,6 +13,9 @@ on:
 env:
   UAL_TAG: v9.7.1
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
