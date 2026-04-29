@@ -80,7 +80,7 @@ static void Log(const char* fmt, ...) {
 }
 
 // ============================================================
-// Pattern Scanner (from localizer's XUtil, simplified)
+// Pattern Scanner (from ShadelessFox/death-stranding-2-localizer XUtil, simplified)
 // ============================================================
 
 static uintptr_t ScanPattern(uintptr_t base, size_t size, const char* mask) {
@@ -244,7 +244,7 @@ static size_t GetModuleImageSize(uintptr_t moduleBase) {
 // Decima engine RTTI helpers
 // ============================================================
 
-// RTTI kind values (from localizer RTTI.h)
+// RTTI kind values (from ShadelessFox/decima-native RTTI.h)
 enum RTTIKind : uint8_t {
     RTTI_Atom      = 0,
     RTTI_Pointer   = 1,
@@ -253,7 +253,7 @@ enum RTTIKind : uint8_t {
     RTTI_Compound  = 4,
 };
 
-// RTTICompound layout (from localizer):
+// RTTICompound layout (from ShadelessFox/decima-native):
 //   +0x00: mId (int32)
 //   +0x04: mKind (uint8)
 //   +0x05: mFactoryFlags (uint8)
@@ -291,7 +291,7 @@ static const char* ObjTypeName(void* obj) {
 }
 
 // ============================================================
-// Decima Array / Ref layout (from localizer PCore)
+// Decima Array / Ref layout (from ShadelessFox/decima-native PCore)
 // ============================================================
 // Array<T>:  { uint32 count, uint32 capacity, T* entries }  = 16 bytes
 // Ref<T>:    { T* ptr }                                      = 8 bytes
@@ -309,7 +309,7 @@ struct RawArray {
 static RawArray* g_musicTrackArr = nullptr;
 
 // ============================================================
-// DSMusicPlayer RTTI field offsets (from Odradek types.json)
+// DSMusicPlayer RTTI field offsets (from ShadelessFox/odradek types.json)
 // ============================================================
 // All offsets relative to object start (includes RTTIRefObject base = 32 bytes)
 
@@ -365,13 +365,15 @@ struct CustomTrack {
     std::string artist;
     std::string title;
     std::string album;
-    std::string filepath;     // original file (mp3/ogg/wav/flac)
-    std::string wemPath;      // cached PCM WEM (WAVE_FORMAT_EXTENSIBLE)
+    std::string filepath;     // UTF-8, for logging only
+    std::wstring filepath_w;  // wide path for file I/O (handles non-ASCII names)
+    std::string wemPath;      // cached PCM WEM (WAVE_FORMAT_EXTENSIBLE), always ASCII-safe
     std::vector<uint8_t> wemBytes; // loaded WEM bytes (for SetMedia)
     uint32_t stableId = 0;    // FNV-1a hash of source filename, used as TrackResource.id
                               // so playlists / favorites persist across boots even
                               // if the user adds/removes/reorders files in sd_music/.
     uint16_t durationSec = 0;
+    double durationMs = 0.0;  // exact duration from PCM sample count
     uint16_t channels = 2;
     uint32_t sampleRate = 48000;
     uint16_t bitsPerSample = 16;
@@ -630,14 +632,10 @@ static void ScanMusicFolder() {
         if (!IsSupportedAudio(nameUtf8.c_str())) continue;
 
         CustomTrack t;
-        // source path stored in ANSI code page so CreateProcessA (ffmpeg /
-        // ffprobe spawn) reads the filename back as the right UTF-16 path
-        // when it converts via CP_ACP. Using UTF-8 here would misdecode
-        // multibyte sequences as CP1252 and fail to open the source.
-        char fullpath[MAX_PATH];
-        snprintf(fullpath, sizeof(fullpath), "%s\\sd_music\\%s",
-                 g_gameDir, nameAcp.c_str());
-        t.filepath = fullpath;
+        wchar_t fullpathW[MAX_PATH];
+        swprintf(fullpathW, MAX_PATH, L"%hs\\sd_music\\%s", g_gameDir, fd.cFileName);
+        t.filepath_w = fullpathW;
+        t.filepath = WideToUtf8(fullpathW);  // UTF-8, for logging only
 
         // cache filename is an ASCII-safe slug so CreateFile lookups behave
         // predictably regardless of unicode in the source name.
@@ -669,9 +667,15 @@ static void ScanMusicFolder() {
         // the user adds, removes, or reorders files in sd_music/.
         t.stableId = StableTrackIdFromName(nameUtf8);
 
-        // for WAV files, we can read duration directly
+        // for WAV files, we can read duration directly (use ACP path since
+        // GetWavDuration uses fopen; non-ASCII WAV names still get durationSec
+        // set during DecodeToPcm from the sample count).
         if (lower_ext(nameUtf8.c_str()) == ".wav") {
-            t.durationSec = GetWavDuration(fullpath);
+            std::string nameAcp2 = WideToAcp(fd.cFileName);
+            char fullpathAcp[MAX_PATH];
+            snprintf(fullpathAcp, sizeof(fullpathAcp), "%s\\sd_music\\%s",
+                     g_gameDir, nameAcp2.c_str());
+            t.durationSec = GetWavDuration(fullpathAcp);
         }
 
         Log("[MUSICMOD] track: \"%s\" by \"%s\" id=0x%08X -> %s\n",
@@ -706,27 +710,39 @@ static char g_ffmpegPath[MAX_PATH] = {};
 static char g_ffprobePath[MAX_PATH] = {};
 
 
+// Read a file via wide-path (CreateFileW) into a vector. Handles filenames
+// with non-ASCII characters that would be corrupted by ACP conversion.
+static bool ReadFileWide(const std::wstring& path, std::vector<uint8_t>& buf) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 512*1024*1024LL) {
+        CloseHandle(h); return false;
+    }
+    buf.resize((size_t)sz.QuadPart);
+    DWORD got = 0;
+    bool ok = ReadFile(h, buf.data(), (DWORD)sz.QuadPart, &got, nullptr)
+              && got == (DWORD)sz.QuadPart;
+    CloseHandle(h);
+    if (!ok) buf.clear();
+    return ok;
+}
+
 // Decode source audio to int16 stereo PCM via native single-header libs.
-// Returns interleaved samples in `outSamples`, channels=2 always (mono is
-// duplicated), sample rate preserved from the source.
+// Takes a pre-loaded file buffer and extension string (no path needed, so
+// non-ASCII filenames work). Returns interleaved stereo samples.
 //
 // Supported: MP3 (dr_mp3), FLAC (dr_flac), OGG Vorbis (stb_vorbis), WAV
-// (dr_wav). Unrecognised extensions return false so the caller can fall
-// back to ffmpeg for OPUS/M4A/etc.
-static bool DecodeAudioNative(const char* path,
-                               std::vector<int16_t>& outSamples,
-                               uint32_t* outSampleRate) {
-    const char* dot = strrchr(path, '.');
-    if (!dot) return false;
-    char ext[16]; size_t i = 0;
-    for (const char* p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++) {
-        ext[i] = (char)tolower((unsigned char)*p);
-    }
-    ext[i] = 0;
-
+// (dr_wav). Returns false for unknown extensions so the caller can fall
+// back to ffmpeg.
+static bool DecodeAudioFromBuffer(const char* ext,
+                                   const std::vector<uint8_t>& fileData,
+                                   std::vector<int16_t>& outSamples,
+                                   uint32_t* outSampleRate) {
     if (strcmp(ext, "mp3") == 0) {
         drmp3 mp3 = {};
-        if (!drmp3_init_file(&mp3, path, nullptr)) return false;
+        if (!drmp3_init_memory(&mp3, fileData.data(), fileData.size(), nullptr)) return false;
         uint64_t totalFrames = drmp3_get_pcm_frame_count(&mp3);
         uint32_t srcCh = mp3.channels, srcRate = mp3.sampleRate;
         std::vector<int16_t> tmp((size_t)totalFrames * srcCh);
@@ -754,7 +770,7 @@ static bool DecodeAudioNative(const char* path,
         return true;
     }
     if (strcmp(ext, "flac") == 0) {
-        drflac* fl = drflac_open_file(path, nullptr);
+        drflac* fl = drflac_open_memory(fileData.data(), fileData.size(), nullptr);
         if (!fl) return false;
         uint64_t totalFrames = fl->totalPCMFrameCount;
         uint32_t srcCh = fl->channels, srcRate = fl->sampleRate;
@@ -779,7 +795,7 @@ static bool DecodeAudioNative(const char* path,
     }
     if (strcmp(ext, "wav") == 0) {
         drwav wv = {};
-        if (!drwav_init_file(&wv, path, nullptr)) return false;
+        if (!drwav_init_memory(&wv, fileData.data(), fileData.size(), nullptr)) return false;
         uint64_t totalFrames = wv.totalPCMFrameCount;
         uint32_t srcCh = wv.channels, srcRate = wv.sampleRate;
         std::vector<int16_t> tmp((size_t)totalFrames * srcCh);
@@ -803,11 +819,10 @@ static bool DecodeAudioNative(const char* path,
     }
     if (strcmp(ext, "ogg") == 0) {
         int err = 0;
-        stb_vorbis* vb = stb_vorbis_open_filename(path, &err, nullptr);
+        stb_vorbis* vb = stb_vorbis_open_memory(fileData.data(), (int)fileData.size(), &err, nullptr);
         if (!vb) return false;
         stb_vorbis_info info = stb_vorbis_get_info(vb);
         uint32_t srcCh = (uint32_t)info.channels, srcRate = info.sample_rate;
-        // stream samples in batches
         std::vector<int16_t> stream;
         const int CH = 2;
         int16_t buf[4096 * 2];
@@ -825,6 +840,28 @@ static bool DecodeAudioNative(const char* path,
         return true;
     }
     return false; // unknown extension
+}
+
+// Legacy wrapper: used for the ConvertWavToWem path which always has an
+// ASCII wemPath. Kept separate from DecodeAudioFromBuffer.
+static bool DecodeAudioNative(const char* path,
+                               std::vector<int16_t>& outSamples,
+                               uint32_t* outSampleRate) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return false;
+    char ext[16]; size_t i = 0;
+    for (const char* p = dot + 1; *p && i < sizeof(ext) - 1; p++, i++)
+        ext[i] = (char)tolower((unsigned char)*p);
+    ext[i] = 0;
+    // Read file via ANSI path (wemPath is always ASCII-safe)
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); long fsz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (fsz <= 0) { fclose(f); return false; }
+    std::vector<uint8_t> buf((size_t)fsz);
+    if (fread(buf.data(), 1, fsz, f) != (size_t)fsz) { fclose(f); return false; }
+    fclose(f);
+    return DecodeAudioFromBuffer(ext, buf, outSamples, outSampleRate);
 }
 
 // Apply linear gain to int16 samples with saturation.
@@ -1315,20 +1352,52 @@ static bool DownloadFFmpeg() {
     return true;
 }
 
+// Read exact duration in milliseconds from a PCM WEM (RIFF/WAVE) file.
+// The wemPath is always ASCII-safe so fopen is fine here.
+static double GetWemExactDurationMs(const char* wemPath) {
+    FILE* f = fopen(wemPath, "rb");
+    if (!f) return 0.0;
+    char hdr[12] = {};
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) || memcmp(hdr+8, "WAVE", 4)) {
+        fclose(f); return 0.0;
+    }
+    uint32_t sampleRate = 0, dataBytes = 0;
+    uint16_t channels = 0;
+    char id[4]; uint32_t sz;
+    while (fread(id, 1, 4, f) == 4 && fread(&sz, 4, 1, f) == 1) {
+        if (memcmp(id, "fmt ", 4) == 0 && sz >= 16) {
+            uint16_t tag; uint32_t rate; uint16_t ch;
+            fread(&tag, 2, 1, f); fread(&ch, 2, 1, f);
+            fread(&rate, 4, 1, f);
+            channels = ch; sampleRate = rate;
+            fseek(f, sz - 8, SEEK_CUR);
+        } else if (memcmp(id, "data", 4) == 0) {
+            dataBytes = sz; break;
+        } else {
+            fseek(f, sz, SEEK_CUR);
+        }
+    }
+    fclose(f);
+    if (!sampleRate || !channels || !dataBytes) return 0.0;
+    uint64_t frames = dataBytes / (uint64_t)(channels * 2); // 16-bit samples
+    return (double)frames / sampleRate * 1000.0;
+}
+
 // Decode source audio to a Wwise-ready PCM WEM at t.wemPath. Native decoder
 // for mp3/flac/ogg/wav, ffmpeg fallback for everything else.
 static bool DecodeToPcm(CustomTrack& t) {
     // cache hit: WEM newer than source -> skip decode/encode entirely.
     WIN32_FILE_ATTRIBUTE_DATA srcAttr, cacheAttr;
-    if (!GetFileAttributesExA(t.filepath.c_str(), GetFileExInfoStandard, &srcAttr)) return false;
+    if (!GetFileAttributesExW(t.filepath_w.c_str(), GetFileExInfoStandard, &srcAttr)) return false;
     if (GetFileAttributesExA(t.wemPath.c_str(), GetFileExInfoStandard, &cacheAttr) &&
         CompareFileTime(&cacheAttr.ftLastWriteTime, &srcAttr.ftLastWriteTime) >= 0) {
-        uint16_t dur = ReadWavOrWemDurationSec(t.wemPath.c_str());
-        if (dur > 0) {
+        double durMs = GetWemExactDurationMs(t.wemPath.c_str());
+        if (durMs > 0.0) {
             t.channels = 2;
             t.sampleRate = 48000;
             t.bitsPerSample = 16;
-            t.durationSec = dur;
+            t.durationMs = durMs;
+            t.durationSec = (uint16_t)(durMs / 1000.0);
             return true;
         }
         // header read failed - fall through and re-encode
@@ -1352,11 +1421,22 @@ static bool DecodeToPcm(CustomTrack& t) {
         if (v >= -40.0 && v <= 6.0) gainDb = v;
     }
 
-    // native decoders (mp3/flac/ogg/wav). Falls through to ffmpeg for
-    // unrecognised formats (m4a/opus/etc).
+    // native decoders (mp3/flac/ogg/wav) via wide-path file read so
+    // non-ASCII filenames (Japanese, Korean, etc.) work on Western Windows.
+    // Falls through to ffmpeg for unrecognised formats (m4a/opus/etc).
+    const char* extDot = strrchr(t.filepath.c_str(), '.');
+    char ext[16] = {};
+    if (extDot) {
+        size_t ei = 0;
+        for (const char* p = extDot + 1; *p && ei < 15; p++, ei++)
+            ext[ei] = (char)tolower((unsigned char)*p);
+    }
+    std::vector<uint8_t> srcBuf;
     std::vector<int16_t> samples;
     uint32_t srcRate = 0;
-    if (DecodeAudioNative(t.filepath.c_str(), samples, &srcRate)) {
+    if (ext[0] && ReadFileWide(t.filepath_w, srcBuf) &&
+        DecodeAudioFromBuffer(ext, srcBuf, samples, &srcRate)) {
+        srcBuf.clear(); srcBuf.shrink_to_fit(); // free before writing WEM
         ApplyGainDb(samples, gainDb);
         uint64_t frames = samples.size() / 2;
         if (!WritePcmWemFile(t.wemPath.c_str(), samples.data(), frames, 2, srcRate)) {
@@ -1366,35 +1446,43 @@ static bool DecodeToPcm(CustomTrack& t) {
         t.channels = 2;
         t.sampleRate = srcRate;
         t.bitsPerSample = 16;
+        t.durationMs = srcRate ? (double)frames / srcRate * 1000.0 : 0.0;
         t.durationSec = srcRate ? (uint16_t)(frames / srcRate) : 0;
-        Log("[MUSICMOD] decoded (native): %s @ %uHz, %us\n",
-            t.filepath.c_str(), srcRate, t.durationSec);
+        Log("[MUSICMOD] decoded (native): %s @ %uHz, %.1fms\n",
+            t.filepath.c_str(), srcRate, t.durationMs);
         return t.durationSec > 0;
     }
 
     // ffmpeg fallback: write a temp .wav at 48kHz/16/stereo, then convert
-    // it to a PCM WEM and remove the temp.
+    // it to a PCM WEM and remove the temp. Uses CreateProcessW so the source
+    // path handles non-ASCII filenames correctly.
     if (!g_ffmpegPath[0]) {
         Log("[MUSICMOD] no native decoder for %s and no ffmpeg available\n",
             t.filepath.c_str());
         return false;
     }
+    // tmpWav is a sibling of the WEM cache, so it's always ASCII-safe.
     char tmpWav[MAX_PATH];
     snprintf(tmpWav, MAX_PATH, "%s.tmp.wav", t.wemPath.c_str());
-    char cmd[MAX_PATH * 3];
-    snprintf(cmd, sizeof(cmd),
-        "\"%s\" -hide_banner -loglevel error -i \"%s\" "
-        "-af volume=%.2fdB "
-        "-ar 48000 -ac 2 -sample_fmt s16 -y \"%s\"",
-        g_ffmpegPath, t.filepath.c_str(), gainDb, tmpWav);
+    // Build wide commandline so non-ASCII source filenames reach ffmpeg intact.
+    wchar_t ffmpegW[MAX_PATH] = {};
+    MultiByteToWideChar(CP_ACP, 0, g_ffmpegPath, -1, ffmpegW, MAX_PATH);
+    wchar_t tmpWavW[MAX_PATH] = {};
+    MultiByteToWideChar(CP_ACP, 0, tmpWav, -1, tmpWavW, MAX_PATH);
+    wchar_t wcmd[MAX_PATH * 4] = {};
+    swprintf(wcmd, MAX_PATH * 4,
+        L"\"%s\" -hide_banner -loglevel error -i \"%s\" "
+        L"-af volume=%.2fdB "
+        L"-ar 48000 -ac 2 -sample_fmt s16 -y \"%s\"",
+        ffmpegW, t.filepath_w.c_str(), gainDb, tmpWavW);
     Log("[MUSICMOD] decoding (ffmpeg fallback): %s\n", t.filepath.c_str());
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+    STARTUPINFOW siW = { sizeof(siW) };
+    siW.dwFlags = STARTF_USESHOWWINDOW;
+    siW.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-        Log("[MUSICMOD] CreateProcess failed for ffmpeg: %lu\n", GetLastError());
+    if (!CreateProcessW(nullptr, wcmd, nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW, nullptr, nullptr, &siW, &pi)) {
+        Log("[MUSICMOD] CreateProcessW failed for ffmpeg: %lu\n", GetLastError());
         return false;
     }
     DWORD waitResult = WaitForSingleObject(pi.hProcess, 180000);
@@ -1420,14 +1508,15 @@ static bool DecodeToPcm(CustomTrack& t) {
     }
     DeleteFileA(tmpWav);
 
-    // duration: read it back from the WEM we just wrote.
+    // duration: read exact ms from the WEM we just wrote.
     {
-        uint16_t dur = ReadWavOrWemDurationSec(t.wemPath.c_str());
+        double durMs = GetWemExactDurationMs(t.wemPath.c_str());
         t.channels = 2;
         t.sampleRate = 48000;
         t.bitsPerSample = 16;
-        t.durationSec = dur;
-        if (dur == 0) {
+        t.durationMs = durMs;
+        t.durationSec = (uint16_t)(durMs / 1000.0);
+        if (durMs == 0.0) {
             Log("[MUSICMOD] dur-read returned 0 for %s\n", t.wemPath.c_str());
         }
     }
@@ -3636,25 +3725,48 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
         // can override / cache freely.
         if (m61MTrkSz > 0x16) mtBody[0x16] = 0;
 
-        // MusicTrack clip duration patches. Previous approach scanned for any
-        // double in 21.7-65.3ms range, which hit a false positive at the
-        // mtBody includes the 4-byte ulID at offset 0. The Frida M61 MTrk
-        // template hex confirmed the float fSrcDuration sits at body+0x67
-        // (clip 0) and body+0x73 (clip 1). The earlier "off-by-4 fix" was
-        // a misread - reverting to the original offsets.
+        // Per-track duration. fSrcDuration must be >= actual PCM length to
+        // avoid early cutoff, but excess headroom causes an audible loop:
+        // when the in-memory buffer runs dry, Wwise restarts it from the
+        // beginning and plays until fSrcDuration is reached. 10ms of
+        // headroom is enough to avoid any cutoff risk while keeping the
+        // loop gap completely inaudible (< one audio frame).
+        // durationMs is exact ms from sample count; fall back to durationSec
+        // or 36000000 (10h sentinel) if unknown.
+        double trackDurMs = 36000000.0;
+        if ((int)i < (int)g_tracks.size()) {
+            if (g_tracks[i].durationMs > 0.0)
+                trackDurMs = g_tracks[i].durationMs + 10.0;
+            else if (g_tracks[i].durationSec > 0)
+                trackDurMs = (double)g_tracks[i].durationSec * 1000.0 + 10.0;
+        }
+
+        // Patch AkTrackSrcInfo.fSrcDuration (double, ms).
+        // AkTrackSrcInfo layout (Wwise 2022): trackID(4) + sourceID(4) +
+        //   fPlayAt(8d) + fBeginTrimOffset(8d) + fEndTrimOffset(8d) +
+        //   unknown(4) + fSrcDuration(8d) = 44 bytes.
+        // Clip array starts at body+0x1B; fSrcDuration lands at body+0x3F.
+        // Scan for doubles in the M61 template range (20000-100000ms) and replace.
+        for (uint32_t off = 0x30; off + 8 <= m61MTrkSz; off++) {
+            double dv = *(double*)(mtBody + off);
+            if (dv > 20000.0 && dv < 100000.0) {
+                if (i == 0) Log("[MUSICMOD] MTrk fSrcDuration @0x%X: %.1fms -> %.1fms\n", off, dv, trackDurMs);
+                *(double*)(mtBody + off) = trackDurMs;
+                off += 7;
+            }
+        }
+        // Float copies at body+0x67/0x73 (duration in seconds, secondary field).
         if (m61MTrkSz >= 0x77) {
+            float trackDurSec = (float)(trackDurMs / 1000.0);
             auto patchFloat = [&](uint32_t off, const char* lbl) {
                 float f = *(float*)(mtBody + off);
                 if (f > 20.0f && f < 100.0f) {
-                    *(float*)(mtBody + off) = 36000.0f; // 10 hours in seconds
-                    if (i == 0) {
-                        Log("[MUSICMOD] MTrk %s @ 0x%X: %.3fs -> 36000.0s\n",
-                            lbl, off, f);
-                    }
+                    *(float*)(mtBody + off) = trackDurSec;
+                    if (i == 0) Log("[MUSICMOD] MTrk %s @0x%X: %.3fs -> %.3fs\n", lbl, off, f, trackDurSec);
                 }
             };
-            patchFloat(0x67, "clip0.fSrcDuration");
-            patchFloat(0x73, "clip1.fSrcDuration");
+            patchFloat(0x67, "clip0");
+            patchFloat(0x73, "clip1");
         }
 
         uint8_t* msBody = nullptr;
@@ -3668,7 +3780,7 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
         // decodes to 43576 ms. Reverted from the 0x50 misfix that crashed.
         if (m61MSegSz >= 0x4C + 8) {
             double oldDur = *(double*)(msBody + 0x4C);
-            double newDur = 36000000.0; // 10 hours
+            double newDur = trackDurMs + 1000.0;
             *(double*)(msBody + 0x4C) = newDur;
             if (i == 0) {
                 Log("[MUSICMOD] segment fDuration patch: %.1fms -> %.1fms (offset 0x4C)\n",
@@ -3676,28 +3788,22 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
             }
         }
 
-        // Also patch any marker fPositions that match the original fDuration
-        // (or any marker position close to it). The "musicend" marker at the
-        // end of the segment likely caps playback independently of fDuration,
-        // which would explain the ~20s cutoff on playlist mode (Wwise hits
-        // the exit marker and ends the segment). Sweep all aligned doubles
-        // in the segment; any that falls near the original duration boundary
-        // (~43s) gets bumped to match our new duration.
+        // Patch the musicend marker. The template marker sits near the original
+        // M61 duration (~43576ms). Set it to trackDurMs so the Decima music
+        // player gets "track ended" at the right time and can advance to the
+        // next track instead of sitting idle until the 10h fDuration expires.
         if (m61MSegSz >= 16) {
             double origDur = 43576.0;
             for (uint32_t off = 0x54; off + 8 <= m61MSegSz; off++) {
-                // skip the fDuration slot we already patched (at 0x4C)
                 if (off == 0x4C) continue;
                 double v = *(double*)(msBody + off);
-                // only patch doubles that are plausibly marker positions
-                // (finite, positive, within ~50% of original segment duration)
                 if (v > origDur * 0.5 && v < origDur * 1.5) {
-                    *(double*)(msBody + off) = 36000000.0;
+                    *(double*)(msBody + off) = trackDurMs;
                     if (i == 0) {
-                        Log("[MUSICMOD] segment marker patch @ 0x%X: %.1fms -> 36000000.0ms\n",
-                            off, v);
+                        Log("[MUSICMOD] segment marker patch @ 0x%X: %.1fms -> %.1fms\n",
+                            off, v, trackDurMs);
                     }
-                    off += 7; // skip past this double
+                    off += 7;
                 }
             }
         }

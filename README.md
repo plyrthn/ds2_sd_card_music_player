@@ -93,8 +93,28 @@ The release artifact also bundles a pinned copy of:
 
 ## Credits
 
-@rudowinger, for the Decima inspector dumps that nailed down the
-UITexture schema and the music player track resource layout.
+**This mod could not exist without @ShadelessFox's work.** Full stop.
+
+[odradek](https://github.com/ShadelessFox/odradek) is the DS2 asset
+viewer and type-schema extractor that made it possible to understand
+the engine's runtime layout at all. Every field offset in
+`DSMusicPlayerTrackResource`, every `StreamingRef` detail, every RTTI
+type descriptor - all of it came out of Odradek's schema dumps.
+[decima-native](https://github.com/ShadelessFox/decima-native) and
+[death-stranding-2-localizer](https://github.com/ShadelessFox/death-stranding-2-localizer)
+provided the foundational Decima engine patterns that the injection
+code is built on - the `RTTIKind` enum and the `Array<T>`/`Ref<T>`
+struct layout in the source came directly from those repos, and the
+Odradek-generated type schema is what nailed down every field offset
+in `DSMusicPlayerTrackResource` and related types. Without those
+tools and that prior research there would have been nothing to start
+from.
+
+@rudowinger, for running Odradek against the live game and sharing the
+resulting dumps - the UITexture layout and StreamingRef details came
+from those.
+
+@mike20160236, for testing and finding the playback duration bug.
 
 ## License
 
