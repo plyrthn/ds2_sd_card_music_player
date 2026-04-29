@@ -94,3 +94,12 @@ jobs:
             --title "${{ steps.sha.outputs.short }}" `
             --notes "Built from commit ${{ steps.sha.outputs.short }}." `
             "$name.zip"
+
+      - name: Upload to Nexus Mods
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: Nexus-Mods/upload-action@v1
+        with:
+          api-key: ${{ secrets.NX_API_KEY }}
+          file-group-id: 7360658
+          filename: ds2_musicplayer-${{ steps.sha.outputs.short }}.zip
+          version: ${{ steps.sha.outputs.short }}
