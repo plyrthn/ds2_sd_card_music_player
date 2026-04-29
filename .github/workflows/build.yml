@@ -97,7 +97,7 @@ jobs:
 
       - name: Upload to Nexus Mods
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: Nexus-Mods/upload-action@v1
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.5
         with:
           api-key: ${{ secrets.NX_API_KEY }}
           file-group-id: 7360658
