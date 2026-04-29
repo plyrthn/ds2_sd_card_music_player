@@ -103,17 +103,82 @@ DSMusicPlayerSystemResource
 
 For a custom track:
 
-1. Build a Wwise WEM at runtime. WwiseConsole encoder if the user has
-   Wwise installed, otherwise a PCM-with-fixed-gain fallback.
+1. Decode user audio to int16 stereo PCM, write a `WAVE_FORMAT_EXTENSIBLE`
+   RIFF file (`.wem`). No external encoder needed - Wwise's PCM source
+   plugin reads this directly.
 2. Build a minimal custom Wwise bank with a music chain
-   (MusicSwitchContainer -> MusicSegment -> MusicTrack -> Sound)
-   cloned from a known-good OG track. Every Wwise object gets a fresh
-   `ulID` so the engine doesn't dedup against the OG.
-3. Hook `AK::SoundEngine::LoadBankMemoryCopy` to load the custom bank.
-4. Hook `AK::SoundEngine::SetMedia` to feed our WEM bytes for the
-   sound IDs the bank expects.
-5. The custom TrackResource's `SoundResource` is a clone of a music-
+   (MusicRanSeqCntr -> MusicSegment -> MusicTrack)
+   cloned from the M61 trial chain (event id `3056202008`). Every HIRC
+   object gets a fresh `ulID` so the engine doesn't dedup against the OG.
+3. Patch durations inside the cloned HIRC items (see below).
+4. Hook `AK::SoundEngine::LoadBankMemoryCopy` to load the custom bank.
+5. Hook `AK::SoundEngine::SetMedia` to feed our WEM bytes for the
+   media IDs the bank expects.
+6. The custom TrackResource's `SoundResource` is a clone of a music-
    capable OG track's, with the WwiseID swapped to point at our bank.
+
+### Duration patching
+
+The M61 template chain has a fixed playback length of ~43.576 seconds
+(the length of the BB's theme preview). Without patching, every custom
+track cuts off at 43 seconds. Three places need to change:
+
+**CAkMusicTrack (type 0x0B), body+0x3F:**
+`AkTrackSrcInfo.fSrcDuration` (double, ms). This is what Wwise actually
+uses to stop reading PCM from the source WEM. The struct layout is:
+```
+trackID      u32  +0x00
+sourceID     u32  +0x04
+fPlayAt      f64  +0x08
+fBeginTrim   f64  +0x10
+fEndTrim     f64  +0x18
+<unknown>    u32  +0x20
+fSrcDuration f64  +0x24   <- body+0x3F relative to full HIRC body start
+```
+Wwise reads this and stops decoding the clip when it reaches
+`fSrcDuration` milliseconds.
+
+**Important:** don't just slam this to 36000000ms (10 hours). If you do,
+Wwise's in-memory PCM source exhausts the buffer but thinks it still has
+~10 hours to play, so it loops the buffer from the start. The track
+never ends - it loops indefinitely because the musicend marker that
+signals "advance to next track" is also far in the future.
+
+The fix is to set `fSrcDuration = actual track duration + 2000ms`. That
+way the PCM plays to its natural end, and Wwise only has 2 seconds of
+"expected data" left when the buffer runs dry, so the source closes
+cleanly. The mod computes exact duration from the decoded sample count:
+`durationMs = (double)frames / sampleRate * 1000.0`.
+
+There are also float copies of the duration (in seconds) at body+0x67
+and body+0x73 that we patch for good measure, but empirically the
+double at 0x3F is the actual cutoff driver.
+
+**CAkMusicSegment (type 0x0A), body+0x4C:**
+`fDuration` (double, ms) - the segment's declared length. Set to
+`durationMs + 1000ms`.
+
+**CAkMusicSegment markers:**
+The "musicend" marker position (another double, ms) controls when the
+Decima music player advances to the next track. It needs to match the
+actual track duration. The marker sits near 43576ms in the template;
+we scan for doubles in the range `[origDur*0.5, origDur*1.5]` and set
+them to `durationMs`. If this is left at 36000000ms the player never
+gets the "ended" signal and sits idle for hours between tracks.
+
+### Non-ASCII filenames
+
+`WideToAcp()` converts wide chars to the ANSI code page. On Western
+Windows (CP1252) Japanese/Korean/Chinese characters become `?`, so
+`fopen(acpPath)` fails and the track is skipped silently.
+
+Fix: store the file path as `std::wstring filepath_w` and use
+`CreateFileW` + `ReadFile` into a `std::vector<uint8_t>`, then decode
+from the buffer using the `*_from_memory` / `*_open_memory` variants
+in dr_mp3, dr_flac, dr_wav, and stb_vorbis. For ffmpeg, pass a wide
+commandline to `CreateProcessW`. The cached WEM path is always ASCII-
+safe (based on the wemPath which uses non-Unicode filenames), so the
+cache-hit path can still use `fopen`.
 
 The "music-capable" filter (`pre-scan OG list, borrow only from
 music-capable rows`) is needed because not all OG tracks route through
@@ -352,8 +417,17 @@ Type descriptors (`data_*` symbols):
 
 ## Credits
 
-@rudowinger, for UITexture / TrackResource schema dumps via Odradek.
-None of this would have moved without those.
+@ShadelessFox, for [odradek](https://github.com/ShadelessFox/odradek),
+[decima-native](https://github.com/ShadelessFox/decima-native), and
+[death-stranding-2-localizer](https://github.com/ShadelessFox/death-stranding-2-localizer).
+The `RTTIKind` enum and `Array<T>`/`Ref<T>` struct layout in the mod
+source came directly from the localizer / decima-native headers. The
+Odradek type schema is what produced all the DSMusicPlayer* field offsets
+used throughout the injection code.
+
+@rudowinger, for running Odradek against the live game and sharing the
+resulting dumps - the UITexture layout, StreamingRef details, and
+MusicJacketImageTextures field discovery all came from those.
 
 The Decima reverse engineering community, particularly the work on
 Horizon Zero Dawn / Death Stranding 1 that established the resource
