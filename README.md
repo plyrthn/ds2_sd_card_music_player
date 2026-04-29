@@ -95,3 +95,9 @@ The release artifact also bundles a pinned copy of:
 
 @rudowinger, for the Decima inspector dumps that nailed down the
 UITexture schema and the music player track resource layout.
+
+## License
+
+MIT - see `LICENSE`. Vendored libraries keep their own licenses (MinHook
+BSD-2, dr_libs / stb_vorbis public domain). UAL ships its own MIT license
+file alongside `version.dll` in the release zip.
