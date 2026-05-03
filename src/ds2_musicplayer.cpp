@@ -1607,6 +1607,35 @@ static bool LoadTrackWemBytes(CustomTrack& t) {
         t.title.c_str(), sz.QuadPart,
         fmtTag, channels, sampleRate, bps, blockAlign, byteRate, dataSize,
         foundFmt ? "" : " NO_FMT", foundData ? "" : " NO_DATA");
+
+    // Derive duration from the WEM's PCM data. byteRate (= sampleRate *
+    // channels * bytesPerSample) and dataSize give us seconds without
+    // re-decoding. Fixes the case where InjectCustomTracks fires before
+    // DecodeToPcm has populated durationSec - the cached WEM is on disk
+    // from a previous run (or just got written), so we can read its
+    // duration without waiting on the decoder. Without this, the in-game
+    // music player UI shows the duration as 00'00 for every custom track
+    // and Wwise refuses to play them. (issue #4)
+    if (foundFmt && foundData && byteRate > 0) {
+        uint16_t derivedSec = (uint16_t)(dataSize / byteRate);
+        if (t.durationSec == 0) {
+            t.durationSec = derivedSec;
+            t.durationMs  = (double)dataSize / byteRate * 1000.0;
+        }
+        // If injection has already happened (pTrackResource set) and the
+        // resource's duration field is still 0, patch it in-place. The
+        // +0x24 field is a uint16_t scalar so this is safe to do without
+        // any synchronization - readers see the new value or the old, no
+        // partial writes.
+        if (t.pTrackResource && derivedSec > 0) {
+            uint16_t* durField = (uint16_t*)((uint8_t*)t.pTrackResource + 0x24);
+            if (*durField == 0) {
+                *durField = derivedSec;
+                Log("[MUSICMOD] post-inject duration patch: \"%s\" -> %us\n",
+                    t.title.c_str(), derivedSec);
+            }
+        }
+    }
     return true;
 }
 
