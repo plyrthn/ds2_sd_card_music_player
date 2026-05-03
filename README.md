@@ -10,6 +10,12 @@ labels.
 > whatever OG cover the game happens to bind. The reverse engineering for
 > per-row jacket binding got pretty far but didn't reach the finish line
 > - notes in `research/RESEARCH.md` if you want to pick it up.
+>
+> **Track limit:** Wwise's music engine has a hardcoded 100-track total
+> cap. The OG game ships with 58 tracks so you can add up to 42 customs
+> right now. Drop more than that into `sd_music/` and the mod will load
+> the first 42 and log a warning. Pushing past 100 needs music engine
+> relocation work that's still in progress - see `research/RESEARCH.md`.
 
 ## How to Use
 
