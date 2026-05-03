@@ -415,6 +415,13 @@ static uint8_t* BuildExtendedBank(int numTracks, uint32_t* outSize, uint32_t new
 static const uint8_t* FindHircItemById(const uint8_t* bank, uint32_t bankSize,
                                         uint8_t wantType, uint32_t wantUlId,
                                         uint32_t* outBodySize);
+// Diagnostic dump of the music engine singleton (defined later in file).
+// Used to map the struct layout for the push-past-100 investigation.
+static void DumpMusicEngineSingleton(const char* tag);
+// Hot-path safe wrapper - dumps once on first non-null observation of the
+// singleton, then once per 5s. Wraps the singleton deref in SEH so it's safe
+// to call from any thread.
+static void MaybeDumpSingleton(const char* tag);
 
 // PostEvent forward decl
 typedef uint32_t (__cdecl* PostEventByIdFn)(
@@ -1700,6 +1707,7 @@ static DWORD WINAPI DecodeWorker(LPVOID) {
     // signal the template rebuilder: WEMs are loaded, bank load + SetMedia
     // can now proceed with valid media data.
     g_wemsReady = true;
+
     return 0;
 }
 
@@ -2019,6 +2027,57 @@ static void InjectCustomTracks(void* sysRes) {
     if (trackArr->count == 0 || artistArr->count == 0) {
         Log("[MUSICMOD] no existing data to reference, aborting injection\n");
         return;
+    }
+
+    // Diagnostic snapshot before we touch anything - shows the engine state
+    // with just the OG tracks loaded, gives us a baseline to diff against.
+    DumpMusicEngineSingleton("InjectCustomTracks PRE");
+
+    // The Wwise music engine has a hardcoded 100-track cap. The engine
+    // singleton (allocated as 10440 bytes via sub_1400a18a0(0x28c8) inside
+    // sub_141eb9500, address stored in data_146230fa8, constructor
+    // sub_140c0fef0) contains three fixed-size 100-cap arrays and one 32-cap
+    // array, all at baked-in offsets. The 100-cap is enforced via 0x64
+    // immediates in sub_140c11d50, sub_140c10d90, and sub_140c12320.
+    //
+    // Singleton struct layout (mapped from sub_140c0fef0):
+    //   +0x000..+0x960 : 100-entry x 24B table (fields init 0/0/0x4b/0x4b/...)
+    //   +0x960..+0x1900: 10 buckets x 400B each (10x100 uint32 IDs)
+    //   +0x1908..+0x1968: scalar state
+    //   +0x1970..+0x22D0: 100-entry x 24B main slot table
+    //   +0x22D0..+0x27D0: 32-entry x 40B table (transition history?)
+    //   +0x27D0..+0x28C8: tail state (volumes, SRWLock, etc.)
+    //
+    // Going past the cap corrupts engine state and crashes a few bank loads
+    // later in sub_140c164b0 (refcount byte at +0x2ba on a stale pointer
+    // reloaded from +0x1918, which is in the scalar state region adjacent to
+    // the bucket array end at +0x1900). The OG game ships with 58 tracks so
+    // user libraries are capped at 100 - oldCount. Pushing past 100 needs
+    // all three arrays relocated to trailing slack in an enlarged singleton
+    // alloc, plus every LEA that computes a table base patched, plus all
+    // 0x64/0x63 immediates patched. Multi-day project, not done here.
+    constexpr uint32_t MUSIC_ENGINE_TRACK_CAP = 100;
+    if ((uint32_t)g_tracks.size() + trackArr->count > MUSIC_ENGINE_TRACK_CAP) {
+        uint32_t allowed = (trackArr->count >= MUSIC_ENGINE_TRACK_CAP)
+                             ? 0u
+                             : (MUSIC_ENGINE_TRACK_CAP - trackArr->count);
+        Log("[MUSICMOD] *** TRACK LIMIT HIT ***\n");
+        Log("[MUSICMOD] *** You have %zu custom tracks but the game's music\n",
+            g_tracks.size());
+        Log("[MUSICMOD] *** engine has a hardcoded 100-track total cap\n");
+        Log("[MUSICMOD] *** (%u OG tracks + %zu custom = %zu, max is %u).\n",
+            trackArr->count, g_tracks.size(),
+            g_tracks.size() + trackArr->count, MUSIC_ENGINE_TRACK_CAP);
+        Log("[MUSICMOD] *** Dropping %zu of your tracks to fit. Move files\n",
+            g_tracks.size() - allowed);
+        Log("[MUSICMOD] *** out of sd_music/ to control which ones load.\n");
+        Log("[MUSICMOD] *** Pushing past 100 needs music engine relocation\n");
+        Log("[MUSICMOD] *** work that's still in progress - see RESEARCH.md.\n");
+        g_tracks.resize(allowed);
+        if (g_tracks.empty()) {
+            Log("[MUSICMOD] no room for any custom tracks (OG already at cap)\n");
+            return;
+        }
     }
 
     // grab vtable sources from existing objects
@@ -2497,6 +2556,12 @@ static void InjectCustomTracks(void* sysRes) {
 
     g_injected = true;
     Log("[MUSICMOD] injection complete\n");
+
+    // Diagnostic: snapshot post-injection. Diff vs PRE shows how the engine
+    // handles our additional Decima tracks (vs how the slot/bucket tables
+    // change). Headroom assessment of +0x22D0..+0x2818 in the dump tells us
+    // if we can extend the slot table into that gap.
+    DumpMusicEngineSingleton("InjectCustomTracks POST");
 
 
     // first test: try reloading the captured bank with a modified bank ID
@@ -3367,6 +3432,13 @@ static int32_t __cdecl Hook_LoadBankById(uint32_t bankId, uint32_t memPoolId) {
 #define CUSTOM_SOUND_BASE  0xAD200000u
 #define CUSTOM_ACTION_BASE 0xAD300000u
 #define CUSTOM_MEDIA_BASE  0xAD400000u
+#define CUSTOM_PARENT_ID   0xAD800001u  // self-hosted clone of the OG MRSC parent
+
+// OG CAkMusicSwitchCntr in bank #15 that the M61 MRSC's DirectParentID points
+// at. We clone this once per bank load instead of every MRSC referencing the
+// OG by ID, which keeps Wwise's per-object byte refcount from saturating once
+// the user has dozens of tracks.
+#define OG_MRSC_PARENT_ID  629350378u
 
 // Build an "extended" bank by copying the captured audio bank
 // and APPENDING custom Sound/Action/Event items to its HIRC chunk.
@@ -3393,6 +3465,42 @@ static const uint8_t* FindHircItemById(const uint8_t* bank, uint32_t bankSize,
                     uint32_t itemId = *(uint32_t*)(bank + ip + 5);
                     if (itemId == wantUlId) {
                         if (outBodySize) *outBodySize = size;
+                        return bank + ip + 5;
+                    }
+                }
+                ip += 5 + size;
+            }
+            return nullptr;
+        }
+        uint32_t cs = *(uint32_t*)(bank + pos + 4);
+        pos += 8 + cs;
+    }
+    return nullptr;
+}
+
+// Same as FindHircItemById but matches on ulID alone (any HIRC type). Used
+// to grab the M61 MRSC's parent without knowing in advance whether it's a
+// CAkMusicSwitchCntr (0x0C), CAkActorMixer (0x07), etc.
+static const uint8_t* FindHircItemByIdAnyType(const uint8_t* bank, uint32_t bankSize,
+                                               uint32_t wantUlId,
+                                               uint32_t* outBodySize, uint8_t* outType) {
+    if (!bank || bankSize < 12) return nullptr;
+    size_t pos = 0;
+    while (pos + 8 <= bankSize) {
+        if (memcmp(bank + pos, "HIRC", 4) == 0) {
+            uint32_t hircSize = *(uint32_t*)(bank + pos + 4);
+            uint32_t numItems = *(uint32_t*)(bank + pos + 8);
+            size_t ip = pos + 12;
+            size_t end = pos + 8 + hircSize;
+            for (uint32_t i = 0; i < numItems && ip + 5 <= end; i++) {
+                uint8_t type = bank[ip];
+                uint32_t size = *(uint32_t*)(bank + ip + 1);
+                if (ip + 5 + size > end) break;
+                if (size >= 4) {
+                    uint32_t itemId = *(uint32_t*)(bank + ip + 5);
+                    if (itemId == wantUlId) {
+                        if (outBodySize) *outBodySize = size;
+                        if (outType) *outType = type;
                         return bank + ip + 5;
                     }
                 }
@@ -3464,11 +3572,8 @@ static uint8_t* BuildExtendedBank(int numTracks, uint32_t* outSize, uint32_t new
     uint32_t newItemsPerTrack = 0;
     if (useMusicChain) {
         // 5 items per track: MusicTrack + MusicSegment + MusicRanSeqCntr + Action + Event
-        // PLUS one diagnostic "piggyback" Event (9-byte body) that targets OG action
-        // so we can isolate: our cloned music is broken vs our bank-load doesn't register NEW items
-        newItemsSize = numTracks * (5*5 + m61MTrkSz + m61MSegSz + m61MRSCSz + m61ActSz + m61EventSz
-                                     + 5 + 9);
-        newItemsPerTrack = 6;
+        newItemsSize = numTracks * (5*5 + m61MTrkSz + m61MSegSz + m61MRSCSz + m61ActSz + m61EventSz);
+        newItemsPerTrack = 5;
     } else {
         if (g_realSoundSize > 0) newItemsSize += numTracks * (5 + g_realSoundSize);
         if (g_realActionSize > 0) newItemsSize += numTracks * (5 + g_realActionSize);
@@ -3558,18 +3663,6 @@ static uint8_t* BuildExtendedBank(int numTracks, uint32_t* outSize, uint32_t new
             appendItem(4, m61Event, m61EventSz, &eBody);
             ReplaceU32(eBody, m61EventSz, M61_EVENT_ID,   newEventId);
             ReplaceU32(eBody, m61EventSz, M61_ACTION_ID,  newActionId);
-
-            // DIAGNOSTIC "piggyback" Event: a new Event in our bank that references
-            // the OG M61 trial Action directly (not our cloned Action). If posting
-            // this Event plays OG audio, we've proven bank-loading DOES register our
-            // new events. If silent too, our extended bank's NEW items never get
-            // registered at all and we need a different bank strategy.
-            uint32_t piggybackEventId = CUSTOM_EVENT_BASE + 0x100u + (uint32_t)i;
-            w8(4);
-            w32(9);
-            w32(piggybackEventId);
-            w8(1);
-            w32(M61_ACTION_ID);
         } else {
             // fallback: plain Sound/Action/Event (won't produce music-engine audio
             // but keeps the bank valid)
@@ -3661,10 +3754,29 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
         return nullptr;
     }
 
+    // Self-host of the MRSC parent was an attempt to dodge the 100-track
+    // engine cap by avoiding cross-bank refs on the OG parent. Turned out
+    // (a) it didn't help with the cap (which is enforced at a totally
+    // different layer in the music engine state machine), and (b) cloning
+    // the OG CAkMusicSwitchCntr verbatim leaves its child list and switch
+    // refs pointing at OG MRSCs Wwise can't resolve -> every custom event
+    // returns playingId=0. Force-disable. The parent template lookup stays
+    // for diagnostic logging only.
+    uint32_t parentSz = 0;
+    uint8_t  parentType = 0;
+    auto parentBody = FindHircItemByIdAnyType(g_audioBank, g_audioBankSize,
+                                               OG_MRSC_PARENT_ID, &parentSz, &parentType);
+    bool selfHostParent = false;  // disabled - see comment above
+    Log("[MUSICMOD] BuildMinimalMusicBank: parent %u %s (type=0x%02X size=%u, self-host disabled)\n",
+        OG_MRSC_PARENT_ID,
+        parentBody ? "found in bank" : "not found",
+        parentType, parentSz);
+
     uint32_t bkhdTotalSize = 8 + bkhdBodySize;
-    uint32_t itemsPerTrack = 6;  // 5 music chain + 1 piggyback
+    uint32_t itemsPerTrack = 5;  // MTrk + MSeg + MRSC + Action + Event
     uint32_t hircBodySize = 4;   // numItems u32
-    hircBodySize += (uint32_t)numTracks * (5*5 + m61MTrkSz + m61MSegSz + m61MRSCSz + m61ActSz + m61EventSz + 5 + 9);
+    hircBodySize += (uint32_t)numTracks * (5*5 + m61MTrkSz + m61MSegSz + m61MRSCSz + m61ActSz + m61EventSz);
+    if (selfHostParent) hircBodySize += 5 + parentSz;  // one extra item for the parent clone
     uint32_t hircTotalSize = 8 + hircBodySize;
     uint32_t bankSize = bkhdTotalSize + hircTotalSize;
 
@@ -3677,7 +3789,7 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
     uint8_t* p = bank + bkhdTotalSize;
     memcpy(p, "HIRC", 4); p += 4;
     *(uint32_t*)p = hircBodySize; p += 4;
-    *(uint32_t*)p = (uint32_t)numTracks * itemsPerTrack; p += 4;
+    *(uint32_t*)p = (uint32_t)numTracks * itemsPerTrack + (selfHostParent ? 1u : 0u); p += 4;
 
     auto w8  = [&](uint8_t v) { *p++ = v; };
     auto w32 = [&](uint32_t v){ *(uint32_t*)p = v; p += 4; };
@@ -3741,20 +3853,21 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
                 trackDurMs = (double)g_tracks[i].durationSec * 1000.0 + 10.0;
         }
 
-        // Patch AkTrackSrcInfo.fSrcDuration (double, ms).
-        // AkTrackSrcInfo layout (Wwise 2022): trackID(4) + sourceID(4) +
-        //   fPlayAt(8d) + fBeginTrimOffset(8d) + fEndTrimOffset(8d) +
-        //   unknown(4) + fSrcDuration(8d) = 44 bytes.
-        // Clip array starts at body+0x1B; fSrcDuration lands at body+0x3F.
-        // Scan for doubles in the M61 template range (20000-100000ms) and replace.
-        for (uint32_t off = 0x30; off + 8 <= m61MTrkSz; off++) {
+        // Patch AkTrackSrcInfo.fSrcDuration (double, ms) at the known fixed
+        // offset body+0x3F. AkTrackSrcInfo is 44 bytes, clip array starts at
+        // body+0x1B, fSrcDuration lands at +0x3F (clip0) and +0x6B (clip1
+        // when present). Sanity-check the existing value is in M61's expected
+        // range so we don't blindly overwrite if the template layout shifts.
+        auto patchSrcDur = [&](uint32_t off, const char* lbl) {
+            if (off + 8 > m61MTrkSz) return;
             double dv = *(double*)(mtBody + off);
             if (dv > 20000.0 && dv < 100000.0) {
-                if (i == 0) Log("[MUSICMOD] MTrk fSrcDuration @0x%X: %.1fms -> %.1fms\n", off, dv, trackDurMs);
                 *(double*)(mtBody + off) = trackDurMs;
-                off += 7;
+                if (i == 0) Log("[MUSICMOD] MTrk %s @0x%X: %.1fms -> %.1fms\n", lbl, off, dv, trackDurMs);
             }
-        }
+        };
+        patchSrcDur(0x3F, "fSrcDuration[0]");
+        patchSrcDur(0x6B, "fSrcDuration[1]");
         // Float copies at body+0x67/0x73 (duration in seconds, secondary field).
         if (m61MTrkSz >= 0x77) {
             float trackDurSec = (float)(trackDurMs / 1000.0);
@@ -3788,16 +3901,18 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
             }
         }
 
-        // Patch the musicend marker. The template marker sits near the original
-        // M61 duration (~43576ms). Set it to trackDurMs so the Decima music
-        // player gets "track ended" at the right time and can advance to the
-        // next track instead of sitting idle until the 10h fDuration expires.
+        // Patch the musicend marker. The template marker sits at the original
+        // M61 duration (43576ms exactly). Set it to trackDurMs so the Decima
+        // music player gets "track ended" at the right time and can advance
+        // to the next track instead of sitting idle until the 10h fDuration
+        // expires. Tight equality match (within 1ms) so we don't accidentally
+        // overwrite anything else that happens to fall in a wider range.
         if (m61MSegSz >= 16) {
-            double origDur = 43576.0;
+            const double origDur = 43576.0;
             for (uint32_t off = 0x54; off + 8 <= m61MSegSz; off++) {
                 if (off == 0x4C) continue;
                 double v = *(double*)(msBody + off);
-                if (v > origDur * 0.5 && v < origDur * 1.5) {
+                if (v > origDur - 1.0 && v < origDur + 1.0) {
                     *(double*)(msBody + off) = trackDurMs;
                     if (i == 0) {
                         Log("[MUSICMOD] segment marker patch @ 0x%X: %.1fms -> %.1fms\n",
@@ -3812,10 +3927,13 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
         appendItem(0x0D, m61MRSC, m61MRSCSz, &mrBody);
         ReplaceU32(mrBody, m61MRSCSz, M61_MUSICRSC_ID,   newMRSCId);
         ReplaceU32(mrBody, m61MRSCSz, M61_MUSICSEG_ID,   newMSegId);
-        // KEEP DirectParentID = 629350378 (CAkMusicSwitchCntr in bank #15) so
-        // the music engine can inherit bus routing. Verified parent is registered
-        // in the loaded HIRC table from bank #15. Without parent inheritance the
-        // MRSC has no bus and audio is silently dropped by sub_1428a6600.
+        // DirectParentID: when the parent template is available, point at our
+        // self-hosted clone (in-bank, no cross-bank refcount on the OG). If we
+        // couldn't find the OG parent, leave the OG ID in place - bus inheritance
+        // still works but the per-track ref accumulation caps the track count.
+        if (selfHostParent) {
+            ReplaceU32(mrBody, m61MRSCSz, OG_MRSC_PARENT_ID, CUSTOM_PARENT_ID);
+        }
 
         uint8_t* aBody = nullptr;
         appendItem(3, m61Act, m61ActSz, &aBody);
@@ -3829,18 +3947,21 @@ static uint8_t* BuildMinimalMusicBank(int numTracks, uint32_t* outSize, uint32_t
         appendItem(4, m61Event, m61EventSz, &eBody);
         ReplaceU32(eBody, m61EventSz, M61_EVENT_ID,   newEventId);
         ReplaceU32(eBody, m61EventSz, M61_ACTION_ID,  newActionId);
+    }
 
-        uint32_t piggybackEventId = CUSTOM_EVENT_BASE + 0x100u + (uint32_t)i;
-        w8(4);
-        w32(9);
-        w32(piggybackEventId);
-        w8(1);
-        w32(M61_ACTION_ID);
+    // Append the self-hosted parent once. This costs one cross-bank ref per
+    // bank load (its own DirectParentID still walks back to the OG bus chain),
+    // but track count no longer adds to that ref - it stays constant.
+    if (selfHostParent) {
+        uint8_t* pBody = nullptr;
+        appendItem(parentType, parentBody, parentSz, &pBody);
+        ReplaceU32(pBody, parentSz, OG_MRSC_PARENT_ID, CUSTOM_PARENT_ID);
     }
 
     *outSize = bankSize;
-    Log("[MUSICMOD] BuildMinimalMusicBank: %u bytes, %u items (chain+piggyback per track)\n",
-        bankSize, (uint32_t)numTracks * itemsPerTrack);
+    Log("[MUSICMOD] BuildMinimalMusicBank: %u bytes, %u tracks x %u items%s\n",
+        bankSize, (uint32_t)numTracks, itemsPerTrack,
+        selfHostParent ? " + self-hosted parent" : "");
 
     static bool s_minDumped = false;
     if (!s_minDumped) {
@@ -4338,6 +4459,10 @@ static uintptr_t g_wssiGetPosFn = 0;
 // InstallMenu heap scanner).
 static uintptr_t g_wssiVtable;
 static void**    g_musicSystemPtr;
+// Music engine singleton (Wwise/Decima music transition state). The slot is
+// resolved via sig scan from sub_140c0fe60's prologue. Deref it to get the
+// heap pointer for the singleton struct (fixed 100-slot table at +0x1978).
+static void**    g_musicEngineGlobal = nullptr;
 
 // Pattern scanner - hex string with ?? for wildcards.
 // Returns first match address in [start, start+size) or 0 if not found.
@@ -4488,6 +4613,112 @@ static void ResolveGameAddresses() {
     if (!g_wssiFactoryB) g_wssiFactoryB = g_gameBase + WSSI_FACTORY_B_OFFSET;
     if (!g_wssiPlayFn)   g_wssiPlayFn   = g_gameBase + WSSI_PLAY_OFFSET;
     if (!g_wssiGetPosFn) g_wssiGetPosFn = g_gameBase + WSSI_GETPOS_OFFSET;
+
+    // Diagnostic: locate the music engine singleton's global slot.
+    // sub_140c0fe60 starts with `mov rax, [rip+disp]` loading data_146230fa8
+    // followed by a very specific test/jz/cmp/jne sequence:
+    //   48 8B 05 ?? ?? ?? ?? 48 85 C0 74 1C 80 39 00 75
+    uintptr_t musicGetterSig = PatternScan(textStart, textSize,
+        "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 1C 80 39 00 75");
+    if (musicGetterSig) {
+        g_musicEngineGlobal = (void**)RipRelTarget(musicGetterSig, 7, 3);
+        Log("[MUSICMOD] music engine singleton global slot @ %p\n", (void*)g_musicEngineGlobal);
+        // First peek - singleton may not be allocated yet at this point in startup,
+        // but we want to know whether it is or not.
+        DumpMusicEngineSingleton("ResolveGameAddresses");
+    } else {
+        Log("[MUSICMOD] music engine singleton sig NOT FOUND\n");
+    }
+}
+
+// Polled by hot-path hooks to dump the singleton the first time it's
+// non-null. After first dump, only dumps once per 5 seconds to keep the log
+// readable. Safe to call from any hook (no allocation, no locks).
+static void MaybeDumpSingleton(const char* tag) {
+    static void* s_lastSeen = nullptr;
+    static DWORD s_lastDumpTick = 0;
+    if (!g_musicEngineGlobal) return;
+    void* cur = nullptr;
+    __try { cur = *g_musicEngineGlobal; } __except(1) { return; }
+    if (!cur) return;
+    DWORD now = GetTickCount();
+    if (cur != s_lastSeen) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "first-seen via %s", tag);
+        DumpMusicEngineSingleton(buf);
+        s_lastSeen = cur;
+        s_lastDumpTick = now;
+    } else if (now - s_lastDumpTick > 5000) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "periodic via %s", tag);
+        DumpMusicEngineSingleton(buf);
+        s_lastDumpTick = now;
+    }
+}
+
+// Diagnostic helper: dump key regions of the music engine singleton so we
+// can map the struct layout and figure out what lives past the 100-slot
+// table at +0x1978..+0x22D8. Specifically targeting the gap +0x22D8..+0x2818
+// to know if there's free space there to extend the slot table into, and
+// the state field region so we can correlate field changes with crashes.
+static void DumpMusicEngineSingleton(const char* tag) {
+    if (!g_musicEngineGlobal) {
+        Log("[MUSICMOD] [DIAG %s] no singleton global ptr resolved\n", tag);
+        return;
+    }
+    void* singleton = nullptr;
+    __try { singleton = *g_musicEngineGlobal; } __except(1) {}
+    if (!singleton) {
+        Log("[MUSICMOD] [DIAG %s] singleton not yet allocated (slot is null)\n", tag);
+        return;
+    }
+
+    SIZE_T heapSize = 0;
+    __try {
+        heapSize = HeapSize(GetProcessHeap(), 0, singleton);
+    } __except(1) { heapSize = (SIZE_T)-1; }
+
+    Log("[MUSICMOD] [DIAG %s] === music engine singleton ===\n", tag);
+    Log("[MUSICMOD] [DIAG %s] singleton @ %p, HeapSize=%zu (0x%zx)\n",
+        tag, singleton, (size_t)heapSize, (size_t)heapSize);
+
+    // Hex dump helper: prints `len` bytes from singleton+offset, 16 per line,
+    // printing the offset within the singleton struct on each line.
+    auto dump = [&](size_t off, size_t len, const char* label) {
+        Log("[MUSICMOD] [DIAG %s] +0x%04zx-+0x%04zx (%s):\n",
+            tag, off, off + len, label);
+        for (size_t i = 0; i < len; i += 16) {
+            char hex[80] = {0};
+            int p = 0;
+            for (size_t j = 0; j < 16 && i + j < len; j++) {
+                uint8_t b = 0;
+                __try { b = *((uint8_t*)singleton + off + i + j); } __except(1) {}
+                p += snprintf(hex + p, sizeof(hex) - p, "%02X ", b);
+            }
+            Log("[MUSICMOD] [DIAG %s]   +%04zx: %s\n", tag, off + i, hex);
+        }
+    };
+
+    // The 16 bucket array (10 buckets * 0x190 bytes each) at +0x960..+0x1908.
+    // Just dump the boundaries + bucket 9's tail (where overflow would land).
+    dump(0x1700, 0x80, "bucket 9 tail (overflow target if 100-cap is hit)");
+    // State region right after the buckets where the crashed +0x1918 lives.
+    dump(0x1900, 0x80, "state fields (incl +0x1918 ptr that crashes)");
+    // Slot table head + first 4 slots (24 bytes per slot).
+    dump(0x1970, 0x60, "slot table head (4 slots)");
+    // Slot table tail + 8 bytes past end.
+    dump(0x22B0, 0x40, "slot table tail (slot 99) + 8B past end");
+    // The mystery gap between slot table end (+0x22D8) and known fields (+0x2818).
+    // If this is mostly zeros, it's headroom we can extend into. If it has
+    // real data, we need to be careful.
+    dump(0x22D0, 0x180, "GAP +0x22D0..+0x2450 (candidate headroom for extension)");
+    dump(0x2450, 0x180, "GAP +0x2450..+0x25D0 (candidate headroom continued)");
+    dump(0x25D0, 0x180, "GAP +0x25D0..+0x2750 (candidate headroom continued)");
+    dump(0x2750, 0xD0,  "GAP +0x2750..+0x2820 (right before known +0x2818 field)");
+    // Known state field region for sanity comparison.
+    dump(0x2820, 0x80, "known state field region (post-gap)");
+
+    Log("[MUSICMOD] [DIAG %s] === end singleton dump ===\n", tag);
 }
 
 // Validate a candidate function address looks like a real x64 function prologue.

@@ -197,6 +197,68 @@ heading. Every custom track is registered against the same cloned
 playback, only menu sorting and the album cover shown in some
 contexts.
 
+### The hardcoded 100-track cap (still working on it)
+
+The Wwise music engine has a 100-track total limit. OG game ships with
+58 tracks, so user libraries cap at 42 customs. Going past 100 corrupts
+engine state and crashes a few bank loads later in `sub_140c164b0`
+(byte refcount decrement on a stale pointer reloaded from
+`*(arg1+0x1918)`, register dump shows `rax=7f7fffff7f80000f` which is
+the FLT_MAX bit pattern from neighboring data bleeding in).
+
+The cap lives in the music engine singleton. Findings so far:
+
+- Singleton is heap-allocated, **exactly 10440 bytes** (`0x28c8`).
+  Allocated by `sub_1400a18a0(0x28c8)` inside `sub_141eb9500` at
+  `141ebae6e`. Constructor `sub_140c0fef0` initializes the layout.
+  Pointer stored in `data_146230fa8`.
+- Cap enforced via `0x64` (decimal 100) immediates in
+  `sub_140c11d50`, `sub_140c10d90`, and `sub_140c12320`. ~30 of them
+  total, mostly in unrolled 8-element copy loops.
+- The struct contains **three 100-cap arrays + one 32-cap array** at
+  fixed offsets:
+  ```
+  +0x000..+0x960 : 100-entry x 24B  table (init 0/0/0x4b/0x4b/...)
+  +0x960..+0x1900: 10 buckets x 400B (10x100 uint32 IDs)
+  +0x1908..+0x1968: scalar state
+  +0x1970..+0x22D0: 100-entry x 24B main slot table
+  +0x22D0..+0x27D0: 32-entry x 40B (transition history?)
+  +0x27D0..+0x28C8: tail state (volumes, SRWLock, etc.)
+  ```
+- Each table is sandwiched against state fields, so in-place extension
+  collides. To go past 100, all three tables need relocation to a
+  trailing slack region in an enlarged singleton allocation.
+
+The path that needs implementing:
+
+1. Hook `sub_1400a18a0` to detect `size == 0x28c8` and return an
+   enlarged buffer (e.g., 0x6000 = 24576 bytes, gives ~14KB slack).
+2. Find every LEA (`lea reg, [rcx+0x1970]`, `[rcx+0x968]`,
+   `[rcx+0x000]`, `[rcx+0x22D0]`) across all music-engine functions
+   and patch the disp32s to redirect to the slack region.
+3. Patch the ~30 `0x64`/`0x63` cap immediates to a higher value.
+4. Test every music engine state transition (battle music, scene
+   change, alt-tab, save/load, music player UI) at >100 tracks - the
+   bug only shows after a few bank loads, not immediately.
+
+Failed attempts that got recorded so they don't get retried:
+
+- **Self-hosting the MRSC parent** (clone OG `CAkMusicSwitchCntr`
+  629350378 into our bank with a new ID, point custom MRSCs at the
+  clone). The cloned parent keeps its child list and switch refs
+  pointing at OG MRSCs Wwise can't resolve, so every custom event
+  returns `playingId=0`. Doesn't help with the 100-cap anyway since
+  the cap is enforced one layer above bank loading. Code stays in
+  for reference but force-disabled at the call site.
+- **Diagnostic dump piggybacked on `LoadBankMemoryView`/`PostEvent`
+  hooks**, and the same dump from a separate watcher thread. Both
+  consistently crashed the game during early bank loading (around
+  bank #18-#24, ~10s into startup) even though the dump function
+  early-returns when the singleton is null. Cause unclear - smells
+  like MinHook trampoline interaction or a static-local init guard
+  in the dump helper. Worked fine when called from the existing
+  `InjectCustomTracks` PRE/POST checkpoints.
+
 ## 4. Album art binding (the part I didn't finish)
 
 The plan was: each custom track displays its own cover art (from MP3
