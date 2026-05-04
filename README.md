@@ -45,6 +45,30 @@ The decoded audio is wrapped in a standard `WAVE_FORMAT_EXTENSIBLE` PCM
 container that Wwise's PCM source plugin reads natively. No proprietary
 encoder needed - the whole pipeline is open source.
 
+## Loudness
+
+Tracks are loudness-normalized to roughly the same listening volume so a
+quiet acoustic track and a brick-walled modern release end up at
+comparable levels. Native-decoded sources (mp3/flac/ogg/wav) get a
+single-pass RMS normalization to -20 dBFS RMS (≈ -16 LUFS) with the
+output peak clamped at -1 dBFS to prevent clipping. Files routed through
+the ffmpeg fallback (m4a/opus/wma/etc) get proper BS.1770 LUFS
+normalization via ffmpeg's `loudnorm` filter, targeted to match.
+
+Override behavior with environment variables (set before launching the
+game):
+
+- `DS2_MUSIC_NORMALIZE=0` - turn normalization off, fall back to a flat
+  per-track gain.
+- `DS2_MUSIC_TARGET_DBFS=-18` - change the integrated RMS target
+  (range -40 to -6 dBFS, default -20).
+- `DS2_MUSIC_GAIN_DB=-3` - flat gain in dB used only when normalization
+  is disabled (range -40 to +6, default -6).
+
+Changing any of those invalidates the cached WEMs - delete
+`sd_music\.cache\wem\` to force a re-encode at the new settings (or
+just bump the cache by deleting the `_version` marker file).
+
 ## Build
 
 Clone with submodules:

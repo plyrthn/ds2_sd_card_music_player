@@ -871,6 +871,36 @@ static bool DecodeAudioNative(const char* path,
     return DecodeAudioFromBuffer(ext, buf, outSamples, outSampleRate);
 }
 
+// Compute integrated RMS over interleaved int16 samples and return dBFS.
+// Used as a cheap stand-in for true LUFS (BS.1770 K-weighting omitted) - good
+// enough for "make every track sit at roughly the same listening volume".
+// Silence returns -inf approximation (-120 dBFS).
+static double ComputeIntegratedRmsDb(const std::vector<int16_t>& samples) {
+    if (samples.empty()) return -120.0;
+    double sumSq = 0.0;
+    for (int16_t s : samples) {
+        double v = (double)s / 32768.0;
+        sumSq += v * v;
+    }
+    double mean = sumSq / (double)samples.size();
+    if (mean <= 1e-12) return -120.0;
+    double rms = sqrt(mean);
+    return 20.0 * log10(rms);
+}
+
+// Sample-peak in dBFS. Used after applying gain to verify we won't clip.
+static double ComputePeakDb(const std::vector<int16_t>& samples) {
+    if (samples.empty()) return -120.0;
+    int32_t maxAbs = 0;
+    for (int16_t s : samples) {
+        int32_t a = s < 0 ? -(int32_t)s : (int32_t)s;
+        if (a > maxAbs) maxAbs = a;
+    }
+    if (maxAbs == 0) return -120.0;
+    double peak = (double)maxAbs / 32768.0;
+    return 20.0 * log10(peak);
+}
+
 // Apply linear gain to int16 samples with saturation.
 static void ApplyGainDb(std::vector<int16_t>& samples, double db) {
     double gain = pow(10.0, db / 20.0);
@@ -1415,12 +1445,34 @@ static bool DecodeToPcm(CustomTrack& t) {
     snprintf(wemDir, MAX_PATH, "%s\\sd_music\\.cache\\wem\\Windows", g_gameDir);
     EnsureDirTree(wemDir);
 
-    // Don't loudness-normalize: integrated-LUFS targeting flattens dynamics
-    // across tracks (a quiet acoustic piece gets boosted to match a fight
-    // theme), which is the opposite of what an artist intends. Keep each
-    // track's native mix. Apply a conservative fixed gain reduction so we
-    // sit at roughly the attenuation level the game's music bus expects.
-    // env var DS2_MUSIC_GAIN_DB sets the dB reduction (default -6).
+    // Loudness handling. Old behavior (flat -6 dB cut) made quiet tracks
+    // like Low Roar's St. Eriksplan inaudible because their native RMS sits
+    // 15+ dB below loud modern masters. New default is RMS-based loudness
+    // normalization: measure each decoded track's integrated RMS, apply
+    // gain to land it at a target dBFS, cap output peak at -1 dBTP to
+    // avoid clipping. This is a cheap approximation of BS.1770 LUFS - good
+    // enough to equalize listening volume across an eclectic library
+    // without dragging in libebur128 as a dependency.
+    //
+    // env vars:
+    //   DS2_MUSIC_NORMALIZE     "0" disables normalization, falls back to
+    //                           legacy flat-gain mode (default: enabled).
+    //   DS2_MUSIC_TARGET_DBFS   target integrated RMS in dBFS for the
+    //                           normalize path (default: -20.0, roughly
+    //                           equivalent to -16 LUFS for typical music).
+    //   DS2_MUSIC_GAIN_DB       legacy flat gain in dB, only used when
+    //                           normalize is disabled (default: -6.0).
+    bool normalize = true;
+    char envNorm[8] = {};
+    if (GetEnvironmentVariableA("DS2_MUSIC_NORMALIZE", envNorm, sizeof(envNorm)) > 0) {
+        if (envNorm[0] == '0') normalize = false;
+    }
+    double targetDbfs = -20.0;
+    char envTarget[32] = {};
+    if (GetEnvironmentVariableA("DS2_MUSIC_TARGET_DBFS", envTarget, sizeof(envTarget)) > 0) {
+        double v = atof(envTarget);
+        if (v >= -40.0 && v <= -6.0) targetDbfs = v;
+    }
     double gainDb = -6.0;
     char envGain[32] = {};
     if (GetEnvironmentVariableA("DS2_MUSIC_GAIN_DB", envGain, sizeof(envGain)) > 0) {
@@ -1444,7 +1496,27 @@ static bool DecodeToPcm(CustomTrack& t) {
     if (ext[0] && ReadFileWide(t.filepath_w, srcBuf) &&
         DecodeAudioFromBuffer(ext, srcBuf, samples, &srcRate)) {
         srcBuf.clear(); srcBuf.shrink_to_fit(); // free before writing WEM
-        ApplyGainDb(samples, gainDb);
+        if (normalize) {
+            // measure -> compute gain to hit target -> peak-clamp -> apply
+            double rmsDb = ComputeIntegratedRmsDb(samples);
+            double peakDb = ComputePeakDb(samples);
+            double appliedDb = targetDbfs - rmsDb;
+            // Cap output peak at -1 dBFS so we don't clip on loud transients.
+            // If applying the gain would push peak above -1 dBFS, reduce.
+            double peakCeiling = -1.0;
+            if (peakDb + appliedDb > peakCeiling) {
+                appliedDb = peakCeiling - peakDb;
+            }
+            // Clamp gain magnitude to a sensible window so we don't blow
+            // up speakers on a near-silent input.
+            if (appliedDb > 24.0) appliedDb = 24.0;
+            if (appliedDb < -24.0) appliedDb = -24.0;
+            Log("[MUSICMOD] normalize: %s rms=%.1fdB peak=%.1fdB -> applied %+.1fdB (target %.1fdB)\n",
+                t.filepath.c_str(), rmsDb, peakDb, appliedDb, targetDbfs);
+            ApplyGainDb(samples, appliedDb);
+        } else {
+            ApplyGainDb(samples, gainDb);
+        }
         uint64_t frames = samples.size() / 2;
         if (!WritePcmWemFile(t.wemPath.c_str(), samples.data(), frames, 2, srcRate)) {
             Log("[MUSICMOD] WritePcmWemFile failed for %s\n", t.filepath.c_str());
@@ -1477,12 +1549,28 @@ static bool DecodeToPcm(CustomTrack& t) {
     wchar_t tmpWavW[MAX_PATH] = {};
     MultiByteToWideChar(CP_ACP, 0, tmpWav, -1, tmpWavW, MAX_PATH);
     wchar_t wcmd[MAX_PATH * 4] = {};
-    swprintf(wcmd, MAX_PATH * 4,
-        L"\"%s\" -hide_banner -loglevel error -i \"%s\" "
-        L"-af volume=%.2fdB "
-        L"-ar 48000 -ac 2 -sample_fmt s16 -y \"%s\"",
-        ffmpegW, t.filepath_w.c_str(), gainDb, tmpWavW);
-    Log("[MUSICMOD] decoding (ffmpeg fallback): %s\n", t.filepath.c_str());
+    if (normalize) {
+        // ffmpeg's loudnorm filter does proper BS.1770 LUFS normalization
+        // in a single pass (less accurate than two-pass but Good Enough).
+        // Map our dBFS-RMS target to a comparable LUFS target. -20 dBFS RMS
+        // is roughly -16 LUFS for typical music; offset by 4 dB to match.
+        double targetLufs = targetDbfs + 4.0;
+        if (targetLufs > -10.0) targetLufs = -10.0;
+        if (targetLufs < -30.0) targetLufs = -30.0;
+        swprintf(wcmd, MAX_PATH * 4,
+            L"\"%s\" -hide_banner -loglevel error -i \"%s\" "
+            L"-af loudnorm=I=%.1f:TP=-1.0:LRA=11 "
+            L"-ar 48000 -ac 2 -sample_fmt s16 -y \"%s\"",
+            ffmpegW, t.filepath_w.c_str(), targetLufs, tmpWavW);
+    } else {
+        swprintf(wcmd, MAX_PATH * 4,
+            L"\"%s\" -hide_banner -loglevel error -i \"%s\" "
+            L"-af volume=%.2fdB "
+            L"-ar 48000 -ac 2 -sample_fmt s16 -y \"%s\"",
+            ffmpegW, t.filepath_w.c_str(), gainDb, tmpWavW);
+    }
+    Log("[MUSICMOD] decoding (ffmpeg fallback%s): %s\n",
+        normalize ? ", loudnorm" : "", t.filepath.c_str());
     STARTUPINFOW siW = { sizeof(siW) };
     siW.dwFlags = STARTF_USESHOWWINDOW;
     siW.wShowWindow = SW_HIDE;
@@ -1643,7 +1731,7 @@ static bool LoadTrackWemBytes(CustomTrack& t) {
 // when ffmpeg filters / wwise conversion settings change so stale caches from
 // older mod versions get re-encoded)
 static void InvalidateStaleCache() {
-    static const char* CACHE_VERSION = "nativedyn-1";
+    static const char* CACHE_VERSION = "loudnorm-rms-1";
     char markerPath[MAX_PATH];
     snprintf(markerPath, MAX_PATH, "%s\\sd_music\\.cache\\_version", g_gameDir);
     char cur[64] = {};
