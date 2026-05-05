@@ -423,6 +423,37 @@ static void DumpMusicEngineSingleton(const char* tag);
 // to call from any thread.
 static void MaybeDumpSingleton(const char* tag);
 
+// Cap extension: hook the music engine ctor to allocate a larger buffer
+// and patch the 100-cap immediates / table-end markers to widen the slot
+// table. Gated behind sd_music/.extend_cap so default behavior is unchanged
+// until proven safe.
+typedef void* (__cdecl* MusicCtorFn)(void* arg1);
+typedef void* (__cdecl* DecimaAllocFn)(size_t sz);
+typedef void  (__cdecl* MusicBucketFillFn)(void* singleton);
+typedef int64_t (__cdecl* DestructorRouterFn)(void* arg1, uint8_t arg2);  // sub_1400ba3c0
+static MusicCtorFn       g_origMusicCtor    = nullptr;
+static MusicBucketFillFn g_origBucketFill   = nullptr;
+static DecimaAllocFn     g_decimaAlloc      = nullptr;  // sub_1400a18a0 (jemalloc-backed)
+static DestructorRouterFn g_origDtorRouter  = nullptr;  // sub_1400ba3c0
+static uintptr_t   g_musicCtorAddr = 0;
+static uintptr_t   g_musicWalkAddr = 0;  // sub_140c11d50
+static uintptr_t   g_musicBucketAddr = 0;  // sub_140c10d90
+static uintptr_t   g_dtorRouterAddr = 0;   // sub_1400ba3c0
+static bool        g_extendCapEnabled = false;
+static bool        g_extendCtorRan    = false;  // set by Hook_MusicCtor
+static void* __cdecl Hook_MusicCtor(void* origBuf);
+static void  __cdecl Hook_BucketFill_SwallowCrash(void* singleton);
+static int64_t __cdecl Hook_DtorRouter(void* arg1, uint8_t arg2);
+static bool PatchByte(void* addr, uint8_t newByte, const char* what);
+static bool PatchU32(void* addr, uint32_t newVal, const char* what);
+// Relocate the slot table from its baked-in offset +0x1970 to +0x4000
+// (in the slack region of our 0x6000 buffer). 200 entries x 24 bytes = 0x12C0
+// total span, ending at +0x52C0, well before the buffer end at +0x6000.
+constexpr uint32_t SLOT_TABLE_NEW_OFFSET = 0x4000;
+constexpr uint32_t SLOT_TABLE_NEW_SIZE   = 0x12C0;  // 200 * 24
+constexpr uint8_t  EXTENDED_CAP_BYTE     = 0xC8;     // 200 (replaces 0x64=100 walks)
+constexpr uint8_t  EXTENDED_CAP_BYTE_DEC = 0xC7;     // 199 (replaces 0x63=99 cmps)
+
 // PostEvent forward decl
 typedef uint32_t (__cdecl* PostEventByIdFn)(
     uint32_t eventId, uint64_t gameObjId, uint32_t flags,
@@ -705,6 +736,77 @@ static void ScanMusicFolder() {
               [](const CustomTrack& a, const CustomTrack& b) {
                   return a.stableId < b.stableId;
               });
+
+    // playlist.txt support - lets users with libraries larger than the
+    // music engine's hardcoded 100-track cap (= 42 customs after the 58
+    // OG tracks) pick which custom tracks load this session. Each non-
+    // empty, non-comment line in sd_music/playlist.txt is a basename of a
+    // file that should be loaded (in playlist order, before anything not
+    // listed). Files in sd_music/ that aren't in the playlist still load
+    // if there's room. Comments are lines starting with #.
+    char playlistPath[MAX_PATH];
+    snprintf(playlistPath, MAX_PATH, "%s\\sd_music\\playlist.txt", g_gameDir);
+    FILE* pf = fopen(playlistPath, "rb");
+    if (pf) {
+        std::vector<std::string> wantOrder;
+        char line[1024];
+        while (fgets(line, sizeof(line), pf)) {
+            // strip CR/LF and trailing whitespace
+            size_t n = strlen(line);
+            while (n && (line[n-1] == '\n' || line[n-1] == '\r' ||
+                          line[n-1] == ' ' || line[n-1] == '\t'))
+                line[--n] = 0;
+            // skip leading whitespace
+            char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '#') continue;
+            wantOrder.emplace_back(p);
+        }
+        fclose(pf);
+        Log("[MUSICMOD] playlist.txt: %zu entries\n", wantOrder.size());
+
+        // Reorder g_tracks: first the entries that match playlist names
+        // (in playlist order), then everything else (preserving stableId
+        // order for the rest). Match is case-insensitive on the basename
+        // (Windows filesystems are case-insensitive so users typing the
+        // wrong case shouldn't get silently dropped).
+        auto basenameOf = [](const std::string& path) -> std::string {
+            size_t s = path.find_last_of("\\/");
+            return (s == std::string::npos) ? path : path.substr(s + 1);
+        };
+        auto eqCI = [](const std::string& a, const std::string& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); i++) {
+                if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+                    return false;
+            }
+            return true;
+        };
+        std::vector<CustomTrack> ordered;
+        ordered.reserve(g_tracks.size());
+        std::vector<bool> taken(g_tracks.size(), false);
+        for (auto& want : wantOrder) {
+            bool found = false;
+            for (size_t i = 0; i < g_tracks.size(); i++) {
+                if (taken[i]) continue;
+                if (eqCI(basenameOf(g_tracks[i].filepath), want)) {
+                    ordered.push_back(std::move(g_tracks[i]));
+                    taken[i] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                Log("[MUSICMOD] playlist.txt: \"%s\" not found in sd_music/\n",
+                    want.c_str());
+            }
+        }
+        // append leftovers in their existing (stableId) order
+        for (size_t i = 0; i < g_tracks.size(); i++) {
+            if (!taken[i]) ordered.push_back(std::move(g_tracks[i]));
+        }
+        g_tracks = std::move(ordered);
+    }
 
     Log("[MUSICMOD] found %zu audio file(s)\n", g_tracks.size());
 }
@@ -2150,12 +2252,14 @@ static void InjectCustomTracks(void* sysRes) {
     // with just the OG tracks loaded, gives us a baseline to diff against.
     DumpMusicEngineSingleton("InjectCustomTracks PRE");
 
-    // The Wwise music engine has a hardcoded 100-track cap. The engine
-    // singleton (allocated as 10440 bytes via sub_1400a18a0(0x28c8) inside
-    // sub_141eb9500, address stored in data_146230fa8, constructor
-    // sub_140c0fef0) contains three fixed-size 100-cap arrays and one 32-cap
-    // array, all at baked-in offsets. The 100-cap is enforced via 0x64
-    // immediates in sub_140c11d50, sub_140c10d90, and sub_140c12320.
+    // The Wwise music engine has a hardcoded 100-track cap (or 200 when the
+    // experimental .extend_cap flag is active and our patches widened the
+    // slot table - see Hook_MusicCtor). The engine singleton (allocated as
+    // 10440 bytes via sub_1400a18a0(0x28c8) inside sub_141eb9500, address
+    // stored in data_146230fa8, constructor sub_140c0fef0) contains three
+    // fixed-size 100-cap arrays and one 32-cap array, all at baked-in
+    // offsets. The 100-cap is enforced via 0x64 immediates in
+    // sub_140c11d50, sub_140c10d90, and sub_140c12320.
     //
     // Singleton struct layout (mapped from sub_140c0fef0):
     //   +0x000..+0x960 : 100-entry x 24B table (fields init 0/0/0x4b/0x4b/...)
@@ -2173,22 +2277,36 @@ static void InjectCustomTracks(void* sysRes) {
     // all three arrays relocated to trailing slack in an enlarged singleton
     // alloc, plus every LEA that computes a table base patched, plus all
     // 0x64/0x63 immediates patched. Multi-day project, not done here.
-    constexpr uint32_t MUSIC_ENGINE_TRACK_CAP = 100;
+    // Cap stays at 100 by default - the LEA-relocation extension attempt
+    // was rolled back after multiple failed attempts (see Hook_MusicCtor
+    // and RESEARCH.md for the dead-end analysis).
+    //
+    // With sd_music/.extend_cap, the upstream cap bumps to 200 AND the
+    // ctor hook hands the engine a 0x6000 buffer (instead of 0x28c8)
+    // so writes past +0x28c8 don't fall off the end. No LEA patches
+    // run - this is the isolation test: does the engine actually
+    // enforce a 100 cap by itself, or were earlier crashes purely
+    // from the LEA patches stomping pointer arithmetic? Slot 100..199
+    // writes land in the original transition-history / tail-state
+    // region (+0x22D0..+0x2D78), so corruption of those regions is
+    // expected if the engine touches them - that's the signal we want.
+    const uint32_t MUSIC_ENGINE_TRACK_CAP = g_extendCapEnabled ? 200u : 100u;
     if ((uint32_t)g_tracks.size() + trackArr->count > MUSIC_ENGINE_TRACK_CAP) {
         uint32_t allowed = (trackArr->count >= MUSIC_ENGINE_TRACK_CAP)
                              ? 0u
                              : (MUSIC_ENGINE_TRACK_CAP - trackArr->count);
         Log("[MUSICMOD] *** TRACK LIMIT HIT ***\n");
-        Log("[MUSICMOD] *** You have %zu custom tracks but the game's music\n",
+        Log("[MUSICMOD] *** You have %zu custom tracks but the music engine\n",
             g_tracks.size());
-        Log("[MUSICMOD] *** engine has a hardcoded 100-track total cap\n");
+        Log("[MUSICMOD] *** is capped at %u total tracks right now\n",
+            MUSIC_ENGINE_TRACK_CAP);
         Log("[MUSICMOD] *** (%u OG tracks + %zu custom = %zu, max is %u).\n",
             trackArr->count, g_tracks.size(),
             g_tracks.size() + trackArr->count, MUSIC_ENGINE_TRACK_CAP);
         Log("[MUSICMOD] *** Dropping %zu of your tracks to fit. Move files\n",
             g_tracks.size() - allowed);
         Log("[MUSICMOD] *** out of sd_music/ to control which ones load.\n");
-        Log("[MUSICMOD] *** Pushing past 100 needs music engine relocation\n");
+        Log("[MUSICMOD] *** Pushing past the cap needs music engine relocation\n");
         Log("[MUSICMOD] *** work that's still in progress - see RESEARCH.md.\n");
         g_tracks.resize(allowed);
         if (g_tracks.empty()) {
@@ -4746,6 +4864,81 @@ static void ResolveGameAddresses() {
     } else {
         Log("[MUSICMOD] music engine singleton sig NOT FOUND\n");
     }
+
+    // Cap-extension hook target sig scans. Both sigs are uniquely anchored
+    // on the function prologue + first few instructions.
+    g_musicCtorAddr = PatternScan(textStart, textSize,
+        "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 BF 64 00 00 00 8B CF 33 F6 48 8D 43 08");
+    Log("[MUSICMOD] [extend] sub_140c0fef0 (music ctor) -> %p\n", (void*)g_musicCtorAddr);
+
+    g_musicWalkAddr = PatternScan(textStart, textSize,
+        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 48 8B E9 48 8D B9 78 19 00 00 BE 64 00 00 00");
+    Log("[MUSICMOD] [extend] sub_140c11d50 (music walk) -> %p\n", (void*)g_musicWalkAddr);
+
+    // sub_140c10d90 - bucket/slot fill, called from the music engine init
+    // sequence and crashed earlier when its slot-table walks disagreed with
+    // patched walks elsewhere. Sig: prologue + cmp [rel data_146230f88], r14
+    g_musicBucketAddr = PatternScan(textStart, textSize,
+        "48 8B C4 48 89 48 08 55 41 56 41 57 48 8D 68 A1 48 81 EC 00 01 00 00 45 33 FF 45 8B F7 44 89 7D 7F 4C 39 35");
+    Log("[MUSICMOD] [extend] sub_140c10d90 (bucket fill) -> %p\n", (void*)g_musicBucketAddr);
+
+    // sub_1400a18a0 - the game's jemalloc-backed allocator. Single arg
+    // (size), returns void*. Critical for the cap-extension hook because
+    // VirtualAlloc'd buffers crash later when jemalloc tries to look up
+    // their chunk metadata.
+    uintptr_t decimaAllocAddr = PatternScan(textStart, textSize,
+        "48 89 5C 24 08 57 48 83 EC 20 65 48 8B 04 25 58 00 00 00 48 8B F9 48 8B 18");
+    g_decimaAlloc = (DecimaAllocFn)decimaAllocAddr;
+    Log("[MUSICMOD] [extend] sub_1400a18a0 (game allocator) -> %p\n", (void*)g_decimaAlloc);
+
+    // sub_1400ba3c0 - generic destructor router. Reads *(arg1+8) as an
+    // object pointer, looks up its allocator, vcalls destructor at +0x90.
+    // Crashes when bucket-fill walks slots whose +8 field contains one
+    // of our 0xAD8..... custom track IDs (treated as object ptr -> AV).
+    // Sig: 40 53 48 83 EC 20 48 8B D9 84 D2 75 ?? 48 8B 51 08 48 85 D2 74 ??
+    g_dtorRouterAddr = PatternScan(textStart, textSize,
+        "40 53 48 83 EC 20 48 8B D9 84 D2 75 ?? 48 8B 51 08 48 85 D2 74 ?? 48 3B 15");
+    Log("[MUSICMOD] [extend] sub_1400ba3c0 (destructor router) -> %p\n", (void*)g_dtorRouterAddr);
+
+    // Check for the opt-in flag file. Default off so users don't get
+    // experimental behavior unless they explicitly enable it.
+    char flagPath[MAX_PATH];
+    snprintf(flagPath, MAX_PATH, "%s\\sd_music\\.extend_cap", g_gameDir);
+    if (GetFileAttributesA(flagPath) != INVALID_FILE_ATTRIBUTES) {
+        if (g_musicCtorAddr && g_musicWalkAddr && g_decimaAlloc) {
+            g_extendCapEnabled = true;
+            g_origMusicCtor = (MusicCtorFn)InstallHookMH(
+                (void*)g_musicCtorAddr, (void*)Hook_MusicCtor, "MusicCtor");
+            if (!g_origMusicCtor) {
+                Log("[MUSICMOD] [extend] ctor hook install FAILED - extension disabled\n");
+                g_extendCapEnabled = false;
+            } else {
+                // Install destructor-router shim if the sig hit. Without
+                // it, the engine AVs in sub_1400ba3c0 the moment the
+                // bucket-fill walks past slot 99 with our custom IDs in
+                // the +8 field of the upper-region slots.
+                if (g_dtorRouterAddr) {
+                    g_origDtorRouter = (DestructorRouterFn)InstallHookMH(
+                        (void*)g_dtorRouterAddr, (void*)Hook_DtorRouter, "DtorRouter");
+                    if (!g_origDtorRouter) {
+                        Log("[MUSICMOD] [extend] dtor-router hook install FAILED\n");
+                    } else {
+                        Log("[MUSICMOD] [extend] dtor-router shim installed (suppresses AV on custom IDs)\n");
+                    }
+                } else {
+                    Log("[MUSICMOD] [extend] dtor-router sig MISS - shim not installed\n");
+                }
+                Log("[MUSICMOD] [extend] OPT-IN extension enabled (sd_music/.extend_cap exists)\n");
+                Log("[MUSICMOD] [extend] WARNING: experimental, may crash. Delete the\n");
+                Log("[MUSICMOD] [extend] WARNING: .extend_cap file to revert.\n");
+            }
+        } else {
+            Log("[MUSICMOD] [extend] flag file present but sigs missing - skipping\n");
+        }
+    } else {
+        Log("[MUSICMOD] [extend] disabled (no sd_music/.extend_cap flag file)\n");
+    }
+
 }
 
 // Polled by hot-path hooks to dump the singleton the first time it's
@@ -4771,6 +4964,277 @@ static void MaybeDumpSingleton(const char* tag) {
         DumpMusicEngineSingleton(buf);
         s_lastDumpTick = now;
     }
+}
+
+// Cap extension: small VirtualProtect-wrapped byte/u32 patcher.
+static bool PatchByte(void* addr, uint8_t newByte, const char* what) {
+    DWORD oldProt = 0;
+    if (!VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        Log("[MUSICMOD] [extend] VirtualProtect failed for %s @ %p: %lu\n",
+            what, addr, GetLastError());
+        return false;
+    }
+    uint8_t orig = *(uint8_t*)addr;
+    *(uint8_t*)addr = newByte;
+    DWORD tmp = 0;
+    VirtualProtect(addr, 1, oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), addr, 1);
+    Log("[MUSICMOD] [extend] patched %s @ %p: 0x%02X -> 0x%02X\n",
+        what, addr, orig, newByte);
+    return true;
+}
+
+static bool PatchU32(void* addr, uint32_t newVal, const char* what) {
+    DWORD oldProt = 0;
+    if (!VirtualProtect(addr, 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        Log("[MUSICMOD] [extend] VirtualProtect failed for %s @ %p: %lu\n",
+            what, addr, GetLastError());
+        return false;
+    }
+    uint32_t orig = *(uint32_t*)addr;
+    *(uint32_t*)addr = newVal;
+    DWORD tmp = 0;
+    VirtualProtect(addr, 4, oldProt, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), addr, 4);
+    Log("[MUSICMOD] [extend] patched %s @ %p: 0x%08X -> 0x%08X\n",
+        what, addr, orig, newVal);
+    return true;
+}
+
+// SEH wrapper around sub_140c10d90 (bucket fill). With LEA-relocation
+// patches active, the original function crashes deep in jemalloc free
+// path because of the implicit-pointer-arithmetic problem. SEH catches
+// the AV so the engine survives - we know it's running with partially-
+// initialized bucket state, but at least we get to see what happens
+// downstream instead of the process dying immediately.
+//
+// This is exploratory - intentionally not a real fix. The crash means
+// some bucket entries didn't get populated, so music routing for those
+// would be broken. Goal: see if the engine still runs at all and what
+// downstream behavior tells us.
+static void __cdecl Hook_BucketFill_SwallowCrash(void* singleton) {
+    if (!g_origBucketFill) return;
+    __try {
+        g_origBucketFill(singleton);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[MUSICMOD] [extend] swallowed crash in sub_140c10d90 (bucket fill)\n");
+        Log("[MUSICMOD] [extend] engine state will be partially initialized\n");
+    }
+}
+
+// sub_1400ba3c0 - generic destructor router. Layout:
+//   if (arg2 != 0) { *arg1 = 0; return 0; }   // shortcut path
+//   void* p = *(arg1 + 8);
+//   if (p == 0) { arg1[0] = arg1[1] = 0; return 0; }   // null path
+//   ...look up allocator, vcall destructor at vtable+0x90, then zero...
+//
+// Crash: when extend_cap is on and the bucket-fill walks into upper-region
+// slots whose +8 field happens to contain one of OUR custom track IDs
+// (0xAD8.....), the function casts that ID to an object pointer, reads
+// its vtable, and AVs at 0xAD800060 (or similar). The IDs leak into
+// adjacent memory because the engine's bucket array is laid out next to
+// the slot table and our custom-ID writes spill across the boundary.
+//
+// Shim: detect 0xAD8..... in the +8 field. If seen, take the same
+// short-circuit the function already takes for the null case - zero
+// the slot and return 0. No vcall, no AV. Real game pointers pass
+// through to the original.
+static int64_t __cdecl Hook_DtorRouter(void* arg1, uint8_t arg2) {
+    if (g_extendCapEnabled && arg1 && arg2 == 0) {
+        __try {
+            uint64_t* slot = (uint64_t*)arg1;
+            uint64_t  field0   = slot[0];   // *(arg1 + 0)
+            uint64_t  ptrField = slot[1];   // *(arg1 + 8)
+            // Custom IDs are 32-bit values with high mask 0xAD800000.
+            // Also block anything that looks like a small (<16MB) "address"
+            // that came from masking one of our IDs to its low 24 bits -
+            // that pattern produces 0x000000000004b166 etc which is also
+            // a guaranteed AV when dereffed as a pointer.
+            // Custom track IDs are 32-bit values with high byte == 0xAD
+            // (CUSTOM_PARENT_ID range 0xAD000000-0xADFFFFFF). Earlier
+            // mask was 0xFFE00000 which only caught 0xAD800000-0xAD9FFFFF
+            // and let 0xADAEC8DE etc through to crash.
+            bool isCustomId = ptrField != 0 &&
+                              (ptrField >> 32) == 0 &&
+                              (ptrField & 0xFF000000ULL) == 0xAD000000ULL;
+            bool isLowGarbage = ptrField != 0 &&
+                                (ptrField >> 32) == 0 &&
+                                (ptrField < 0x01000000ULL);
+            if (isCustomId || isLowGarbage) {
+                static int s_count = 0;
+                if (s_count++ < 10) {
+                    Log("[MUSICMOD] [extend] dtor-router: short-circuit field0=0x%llx field8=0x%llx %s\n",
+                        (unsigned long long)field0,
+                        (unsigned long long)ptrField,
+                        isCustomId ? "(custom ID)" : "(low garbage)");
+                } else if (s_count == 10) {
+                    Log("[MUSICMOD] [extend] dtor-router: (further short-circuits silenced)\n");
+                }
+                slot[0] = 0;
+                slot[1] = 0;
+                return 0;
+            }
+            // Pass-through diagnostic: only log AFTER our ctor hook has
+            // run (so we don't waste the budget on init-time normal calls).
+            // Filter to "suspicious" values - anything where the upper 24
+            // bits of the pointer field are zero. Real game heap pointers
+            // are 0x4XX....... or similar; any zero-upper-bits value is
+            // either an integer ID or stack-aliased garbage and would AV
+            // when dereferenced.
+            if (g_extendCtorRan) {
+                bool suspicious = (ptrField >> 40) == 0;
+                if (suspicious) {
+                    static int s_susCount = 0;
+                    if (s_susCount++ < 50) {
+                        Log("[MUSICMOD] [extend] dtor-router: SUSPICIOUS arg1=%p field0=0x%llx field8=0x%llx\n",
+                            arg1,
+                            (unsigned long long)field0,
+                            (unsigned long long)ptrField);
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // arg1 itself was bad - fall through to original
+        }
+    }
+    return g_origDtorRouter ? g_origDtorRouter(arg1, arg2) : 0;
+}
+
+// Hook the music engine constructor. Called once at startup with a 0x28c8
+// byte buffer freshly allocated by sub_1400a18a0. We replace the buffer
+// with a larger one so the engine's tables (slot table at +0x1970, etc)
+// have room to grow into trailing slack. Then we patch the cap immediates
+// and end markers to make the engine actually use the extra space.
+//
+// Original buffer is leaked (10440 bytes one-time cost - we don't know
+// the right deallocator pattern for the Decima per-thread allocator).
+static void* __cdecl Hook_MusicCtor(void* origBuf) {
+    if (!g_extendCapEnabled || !g_origMusicCtor) {
+        // pass-through if extension is off or trampoline missing
+        return g_origMusicCtor ? g_origMusicCtor(origBuf) : nullptr;
+    }
+
+    constexpr size_t LARGER_SIZE = 0x6000;  // 24576 bytes, +14264 slack
+    // Use the game's own allocator (jemalloc-backed) instead of
+    // VirtualAlloc. Earlier crashes proved that VirtualAlloc memory has
+    // no jemalloc chunk metadata, so any later code path that hands a
+    // pointer-into-our-buffer to the heap (free/realloc) crashes when
+    // jemalloc looks up the arena via `addr & ~0x3FFFFF`. Allocating
+    // through sub_1400a18a0 puts us in the same arena as the original
+    // singleton.
+    void* big = nullptr;
+    if (g_decimaAlloc) {
+        big = g_decimaAlloc(LARGER_SIZE);
+    }
+    if (!big) {
+        Log("[MUSICMOD] [extend] decima alloc(0x6000) failed - falling back to orig\n");
+        return g_origMusicCtor(origBuf);
+    }
+    // Decima allocator doesn't zero memory; the constructor zeroes most
+    // of what it knows about, but the trailing slack (slot table etc)
+    // needs to be zeroed too so walks see "empty slot" not garbage.
+    memset(big, 0, LARGER_SIZE);
+    Log("[MUSICMOD] [extend] redirecting music singleton: %p (0x28c8) -> %p (0x%zx) [via decima alloc]\n",
+        origBuf, big, LARGER_SIZE);
+
+    // Run the constructor on OUR larger buffer. The ctor zero-inits the
+    // 10440 bytes it knows about; trailing slack stays zeroed (memset
+    // above).
+    void* ret = g_origMusicCtor(big);
+
+    // LEA-relocation of the slot table from +0x1970 to +0x4000 was tried
+    // both with VirtualAlloc and with the game's own allocator and crashed
+    // identically in jemalloc's arena helper (sub_14284ede0) called from
+    // sub_140c10d90's realloc path. Switching the allocator fixed the
+    // buffer-provenance class of bug but the crash signature stayed the
+    // same, which means there's a SECOND class of bug:
+    //
+    // The engine has implicit pointer arithmetic somewhere - probably
+    // `idx = (slot_ptr - &singleton[0x1970]) / 24` to recover a slot
+    // index. We patch the LEAs that LOAD the slot base, so the engine
+    // gets a slot_ptr at +0x4000+i*24 instead of +0x1970+i*24. Code
+    // doing the recovery arithmetic computes `(0x4000-0x1970)/24 + i`
+    // for the index - wildly wrong. That index then lookups into other
+    // tables, returns garbage pointer, jemalloc crashes freeing it.
+    //
+    // Finding every site that does that arithmetic is the rest of the
+    // work. Sites would be `lea reg, [slot_ptr - 0x1970]` or computed
+    // `sub reg, 0x1970` patterns. Until those are found, LEA-relocation
+    // is broken regardless of how clean the buffer is.
+    //
+    // For now: skip the LEA patches. Keep the game-allocator buffer
+    // redirect (proven safe). Engine cap stays at 100, but the
+    // foundation is right for whoever picks this up next.
+    // LEA-relocation: tried with VirtualAlloc, with game allocator, with
+    // SEH wrapper around sub_140c10d90 - same crash signature every time
+    // (jemalloc dereferencing one of our custom IDs as a pointer because
+    // some engine code does implicit pointer arithmetic on the slot table
+    // base). Each attempt confirmed the same root cause from a different
+    // angle. SEH on sub_140c10d90 didn't even fire because either the
+    // hook trampoline breaks SEH unwinding or the crash happens deeper in
+    // a call chain SEH doesn't reach.
+    //
+    // The patch path is disabled. The buffer-redirect-via-game-allocator
+    // scaffolding stays in place (proven safe) for whoever picks this up
+    // next - probably needs the hook-and-reimplement approach (Plan B
+    // proper, ~500 lines of careful slot-table backing-store code).
+    Log("[MUSICMOD] [extend] LEA patch path disabled (impl-pointer-arith confirmed)\n");
+    Log("[MUSICMOD] [extend] cap stays at 100, buffer redirect is the only active piece\n");
+    g_extendCtorRan = true;  // gate the dtor-router PASS logging
+    return ret;
+
+    // ===== unreachable scaffolding - kept for future iteration =====
+    int patches = 0;
+
+    // === sub_140c11d50 (refcount walk) ===
+    if (g_musicWalkAddr) {
+        // +0x1D: lea rdi, [rcx+0x1978]  (slot[0]+8 walked head)
+        //   bytes: 48 8D B9 78 19 00 00, disp32 at +0x20 -> 0x4008
+        if (PatchU32((void*)(g_musicWalkAddr + 0x20), SLOT_TABLE_NEW_OFFSET + 8,
+                     "walk: head LEA disp")) patches++;
+        // +0x24: BE 64 00 00 00 (mov esi, 0x64), imm at +0x25 -> 0xC8
+        if (PatchByte((void*)(g_musicWalkAddr + 0x25), EXTENDED_CAP_BYTE,
+                      "walk: loop count")) patches++;
+        // +0x6C: lea rax, [rbp+0x1970] (slot table base) - bytes: 48 8D 85 70 19 00 00
+        if (PatchU32((void*)(g_musicWalkAddr + 0x6F), SLOT_TABLE_NEW_OFFSET,
+                     "walk: base LEA disp")) patches++;
+        // +0x73: lea rdx, [rax+0x960] (end marker) - bytes: 48 8D 90 60 09 00 00
+        if (PatchU32((void*)(g_musicWalkAddr + 0x76), SLOT_TABLE_NEW_SIZE,
+                     "walk: end marker disp")) patches++;
+    }
+
+    // === sub_140c10d90 (bucket/slot fill) ===
+    if (g_musicBucketAddr) {
+        // Walk #1: add rax, 0x1970 + lea r8, [rax+0x960]
+        if (PatchU32((void*)(g_musicBucketAddr + 0xE2), SLOT_TABLE_NEW_OFFSET,
+                     "bucket: walk1 add disp")) patches++;
+        if (PatchU32((void*)(g_musicBucketAddr + 0xE9), SLOT_TABLE_NEW_SIZE,
+                     "bucket: walk1 end disp")) patches++;
+        // Walk #2: lea rax, [r15+0x1970] + lea rcx, [rax+0x960]
+        if (PatchU32((void*)(g_musicBucketAddr + 0x328), SLOT_TABLE_NEW_OFFSET,
+                     "bucket: walk2 base disp")) patches++;
+        if (PatchU32((void*)(g_musicBucketAddr + 0x32F), SLOT_TABLE_NEW_SIZE,
+                     "bucket: walk2 end disp")) patches++;
+        // Walk #3: lea rax, [r15+0x1970] + lea rcx, [rax+0x960]
+        if (PatchU32((void*)(g_musicBucketAddr + 0x714), SLOT_TABLE_NEW_OFFSET,
+                     "bucket: walk3 base disp")) patches++;
+        if (PatchU32((void*)(g_musicBucketAddr + 0x71B), SLOT_TABLE_NEW_SIZE,
+                     "bucket: walk3 end disp")) patches++;
+
+        // The 24 cap immediates at +0xA59..+0xEBC are BUCKET-FILL bounds,
+        // not slot table. Bumping them caused the engine to write 200
+        // entries into 100-entry buckets, overflowing adjacent bucket
+        // memory and crashing in the free-list manipulator at
+        // sub_14284ede0. Leaving them at original 0x64.
+        //
+        // The slot table walks at lines 110B0+/114A0+ use end-pointer
+        // comparison, not counts - already covered by the LEA disp32
+        // patches above.
+    }
+
+    Log("[MUSICMOD] [extend] applied %d patches: slot table relocated to +0x%X, walks scan %d\n",
+        patches, SLOT_TABLE_NEW_OFFSET, EXTENDED_CAP_BYTE);
+    return ret;
 }
 
 // Diagnostic helper: dump key regions of the music engine singleton so we

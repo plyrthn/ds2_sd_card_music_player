@@ -197,6 +197,92 @@ heading. Every custom track is registered against the same cloned
 playback, only menu sorting and the album cover shown in some
 contexts.
 
+### LEA-relocation is a dead end (confirmed)
+
+Tried full LEA relocation of the slot table from +0x1970 to +0x4000
+with TWO different buffer allocators:
+
+1. VirtualAlloc'd buffer + LEA patches: crashed in `sub_14284ede0`
+   (jemalloc arena helper) at `buf & ~0x3FFFFF + 0x60`. VirtualAlloc
+   memory has no jemalloc chunk header, so when the engine handed a
+   pointer-into-our-buffer to the heap free path, jemalloc's
+   `addr & ~0x3FFFFF` chunk lookup hit unmapped memory.
+
+2. Game-allocator buffer (`sub_1400a18a0`) + LEA patches: crashed
+   IDENTICALLY at the same address with the same signature.
+
+Same crash signature with proper jemalloc chunks rules out buffer
+provenance as the root cause. The remaining hypothesis is the engine
+has implicit pointer arithmetic somewhere - probably
+`idx = (slot_ptr - &singleton[0x1970]) / 24` or
+`singleton = slot_ptr - 0x1970` style code. Patched LEAs change WHERE
+slot pointers come from, but unrelated arithmetic sites still assume
+the original `0x1970` offset and produce wildly wrong indices that
+get fed into other lookup tables, returning garbage pointers, eventually
+crashed by the heap free path.
+
+To proceed, would need to find every site doing that arithmetic. Sites
+look like `lea reg, [slot_ptr - 0x1970]`, `sub reg, 0x1970`, or
+computed-via-LEA negative offsets. They're scattered across multiple
+functions and not enumerable without exhaustive disassembly + careful
+testing. The buffer-redirect-via-game-allocator scaffolding stays in
+the code (gated behind `.extend_cap`) for future work but the LEA
+patch path is disabled.
+
+### Background notes (the steps that led to the dead end)
+
+Tried allocating a larger 0x6000-byte buffer via VirtualAlloc, redirecting
+the music engine ctor to use it, and patching all the
+`lea reg, [base+0x1970]` + `add reg, 0x960` instructions in
+sub_140c11d50 / sub_140c10d90 to relocate the slot table to +0x4000
+(well into the slack region).
+
+Buffer-redirect alone (no patches) ran cleanly. Adding the LEA patches
+crashed in `sub_14284ede0` (jemalloc arena helper) called from
+`sub_140c10d90`'s realloc path. Crash diagnostics:
+- Faulting address: our_buf base masked to 4MB alignment
+  (`buf & ~0x3FFFFF + 0x60`)
+- That's the jemalloc chunk-metadata location for our buffer's chunk
+- VirtualAlloc memory has NO jemalloc chunk header, so the read gets
+  garbage
+
+Two interlocking problems:
+
+1. **Buffer provenance** - the VirtualAlloc'd buffer has no jemalloc
+   metadata, so any code path that hands a pointer-into-our-buffer to
+   the heap (free, realloc) crashes when the heap looks up the arena.
+   Fix: allocate via the game's own allocator (`sub_1400a18a0`) instead
+   of VirtualAlloc - same heap, same arena, same metadata.
+
+2. **Implicit pointer arithmetic on table bases** - the music engine
+   may have code like `idx = (slot_ptr - &singleton[0x1970]) / 24` to
+   recover slot indices. We can patch the LEAs that LOAD the table base,
+   but this arithmetic might use the original `0x1970` baked into other
+   instructions (or computed via `lea + sub`). Relocating the table
+   would make those calculations produce wildly wrong indices that get
+   fed to other lookup tables, returning bogus pointers, eventually
+   crashing.
+
+Path forward:
+
+- Switch buffer allocator to `sub_1400a18a0` (sig already known). Test
+  if buffer redirect still works. If yes, jemalloc is happy.
+- Then attempt LEA patches with the proper allocator. If it STILL
+  crashes, problem #2 is real and the LEA-relocation strategy is doomed.
+- If problem #2 is real, switch to a hook approach: intercept the
+  slot-table-walking functions (sub_140c11d50, sub_140c10d90) entirely
+  and re-implement them with our own larger backing store. ~500 lines
+  of reimplementation but avoids implicit-arithmetic mismatches.
+- OR alternate cap dodge: intercept the music-engine "register track"
+  function (haven't found it yet) so only 100 tracks ever go through,
+  but they're swapped out at runtime as the user picks different tracks
+  in the player UI. "Paged" track set rather than truly extended cap.
+
+Knowledge captured: alloc site found, struct mapped (10440 bytes), all
+~50 cap immediates and 11 LEAs identified, jemalloc interaction
+diagnosed. Future work picks up at "switch allocator, attempt LEA
+patches, evaluate if pointer-arithmetic problem is real".
+
 ### The hardcoded 100-track cap (still working on it)
 
 The Wwise music engine has a 100-track total limit. OG game ships with
@@ -240,6 +326,246 @@ The path that needs implementing:
 4. Test every music engine state transition (battle music, scene
    change, alt-tab, save/load, music player UI) at >100 tracks - the
    bug only shows after a few bank loads, not immediately.
+
+#### Cap immediates and LEAs mapped so far
+
+Constructor `sub_140c0fef0` (only 5 LEAs total - clean):
+
+```
+140c0ff02  mov edi, 0x64                       ; MASTER COUNTER (reused twice)
+140c0ff07  mov ecx, edi                        ; first loop count = 100
+140c0ff0b  lea rax, [rbx+0x8]                  ; LEA: first table base+8
+                                               ; [loop fills 100 x 24B at +0x000]
+140c0ff3c  lea rcx, [rbx+0x960]                ; LEA: bucket array base
+140c0ff45  mov r8d, 0xfa0                      ; bucket array size (4000 bytes)
+                                               ; [memset(arg1+0x960, 0, 0xfa0)]
+140c0ff57  lea rax, [rbx+0x1970]               ; LEA: slot table base
+                                               ; [loop reuses rdi (still 100) - 100 x 24B]
+140c0ffc4  lea rcx, [rbx+0x22d0]               ; LEA: transition history base
+140c0ffcb  mov edx, 0x20                       ; transition history cap (32 entries)
+                                               ; [loop fills 32 x 40B at +0x22d0]
+```
+
+Trick: the constructor reuses `edi=0x64` as count for BOTH the first
+table (+0x000) and the slot table (+0x1970). Patching one immediate
+extends both. Convenient.
+
+Caller `sub_141eb9500` line 141ebae6e:
+
+```
+141ebae6e  void* rax_150 = sub_1400a18a0(0x28c8)        ; ALLOC SITE
+141ebae80  rbx_36 = sub_140c0fef0(rax_150)              ; ctor
+141ebae8b  data_146230fa8 = rbx_36                      ; assign global
+141ebae92  sub_140c14d70(rbx_36)                        ; post-init #1
+141ebae9f  sub_140c10300(rbx_36, sub_140c109f0(rbx_36)) ; post-init #2
+141ebaea7  sub_140c10880(rbx_36)                        ; post-init #3
+141ebaeaf  sub_140c10d90(rbx_36)                        ; post-init #4 - bucket fill
+141ebaeb7  sub_140c11ee0(rbx_36)                        ; post-init #5 - slot fill
+```
+
+Refcount/walk function `sub_140c11d50`:
+
+```
+140c11d6d  lea rdi, [rcx+0x1978]               ; LEA: slot table head (+8)
+140c11d74  mov esi, 0x64                       ; CAP: 100 iterations
+140c11dbc  lea rax, [rbp+0x1970]               ; LEA: slot table base
+140c11dc3  lea rdx, [rax+0x960]                ; LEA: end-of-table marker (size=100*24)
+```
+
+Bucket walk `sub_140c11fa0`:
+
+```
+140c11fdd  call sub_14017ebe0(arg3, 0x64)      ; alloc capacity hint (NOT a hard cap -
+                                               ;  array grows via sub_1400dcd20)
+140c11ff1  rdi = 9                             ; bucket idx capped at 9 (10 buckets)
+140c12001  lea i = (rdi+6)*0x190 + arg1        ; bucket base = arg1 + (rdi+6)*0x190
+140c1200e  while (i != &i[0x64])               ; CAP: 100 entries per bucket
+```
+
+Bucket-walk + slot-update function `sub_140c12320` (heavily unrolled,
+~17 cap immediates):
+
+```
+140c12330  mov eax, [rcx+0x1900]               ; load current bucket idx (0..9)
+140c12351  cmovg eax, ecx                      ; cap at 9
+140c1235d  imul rax, rax, 0x190                ; bucket stride (400)
+140c123d6  add rax, 0x968                      ; bucket base = arg1 + idx*0x190 + 0x968
+                                               ;   (with imul output already including arg1)
+140c123ea  cmp r11, 0x63                       ; CAP CHECK x16 in unrolled body
+140c1240b  ja 0x140c12410                      ;   (each branch with `cmp r11, 0x63` /
+140c12407  cmp r11, 0x63                       ;    `cmp ecx, 0x64` repeated)
+... [16 more cap branches in 8-element-unrolled copy loop]
+140c125ba  cmp r11, 0x64                       ; OUTER LOOP CAP
+
+140c125c4  mov r8, [r9+0x1940]                 ; +0x1940 = a state pointer
+140c125cb  movsxd rax, [r9+0x1938]             ; +0x1938 = a state count
+140c125d2  imul rdi, rax, 0x38                 ; 56-byte stride iteration
+140c12631  add r8, 0x38                        ; iterates through 56-byte entries
+140c1265b  lea rcx, [r9+0x1930]                ; LEA: another field
+140c12688  lea rcx, [r9+0x1930]                ; (same)
+140c126b1  mov [r9+0x1930], ebx                ; writes to +0x1930
+140c126c8  jmp 0x140c12120                     ; tail-call to dynamic-array helper
+```
+
+Note: the `0x190 + 0x968` pattern in `sub_140c12320` is the bucket
+base formula: `arg1 + bucket_idx*0x190 + 0x968`. The formula assumes
+buckets are 0x190 (400) bytes each starting at +0x968. Patching to
+support more entries per bucket changes 0x190.
+
+Total enforcement points found so far:
+
+| Function       | Cap immediates | Tables touched (LEA / arith)        |
+|----------------|----------------|-------------------------------------|
+| sub_140c0fef0 (ctor)   | 1 (master 0x64) + 1 (0x20)| 4 LEAs: +0x008, +0x960, +0x1970, +0x22d0 |
+| sub_140c14d70 (post-init) | 2 (i_2/i_3=0xa) + ~10 unrolled blocks | inline writes, no relocation possible |
+| sub_140c10d90 (post-init) | ~20 (mix 0x64/0x63 + outer 0xa) | 3 walks of slot table, 1 walk of bucket array, allocates per-bucket via sub_1400b69a0(0x190) |
+| sub_140c11d50 (refcount walk) | 1 (0x64) | 3 LEAs: +0x1970, +0x1978, +0x960 size |
+| sub_140c11fa0 (bucket walker) | 1 walk (0x64) + 1 alloc hint | 1 imul-based bucket compute |
+| sub_140c12320 (unrolled copy) | ~17 (mix 0x64/0x63) | imul+add for buckets, 9 LEA-like base computations |
+| sub_140c11ee0 (post-init #5) | 0 (uses dyn arrays at +0x1948) | walks +0x1940 array (38B stride - separate structure) |
+| sub_140c11fa0 callees... | TBD | TBD |
+
+Conservative total: **~50 cap immediates + 11 LEAs** across the
+post-init and runtime functions. Plus whatever lives in
+sub_140c10300, sub_140c10880, sub_140c109f0 (also called from the
+init sequence at sub_141eb9500).
+
+Critical detail learned from `sub_140c14d70`: the first table at
++0x000 is initialized via **10 nested unrolled wmemcpy blocks per
+outer iteration** (10 outer × 10 unrolled = 100 entries). Extending
+this past 100 isn't a single immediate patch - the unrolling is
+structural. Same for several other init paths.
+
+Critical detail from `sub_140c10d90`: the slot table at +0x1970 is
+walked **THREE times** in this single function via the pattern
+`lea rax, [rcx+0x1970]; add rcx, 0x960; while (rax != rcx) ... rax
++= 0x18`. The 0x960 is the END pointer (100*24). To extend the slot
+table we'd need to patch 0x960 → larger AND ensure the table physically
+extends to the new boundary.
+
+Strategy options ranked from simplest to most invasive:
+
+A. **Just patch the 1 master 0x64 in the constructor** to a smaller
+   value (e.g., 0x32 = 50) and see what happens. Safe experiment - if
+   the engine then crashes at 50 tracks, that proves the constructor's
+   cap matters and the other immediates need patching too. If it still
+   works at 100, the constructor cap is just for init scope and other
+   walks self-limit.
+
+B. **Hook sub_1400a18a0(0x28c8)** to allocate larger but DON'T move
+   tables - just enlarges trailing slack. Patch ONLY the master 0x64
+   in the constructor + the 2 caps in sub_140c11d50. Tables grow into
+   adjacent state regions (corrupting them) but maybe specific
+   downstream code doesn't care if those state fields are nonzero.
+   High crash risk but quick experiment.
+
+C. **Full relocation**: Hook alloc to enlarge, move all 3 tables to
+   trailing slack, patch every LEA + every cap immediate. Multi-day,
+   high test burden, real fix.
+
+Trick option D: **two-stage cap**. Keep tables at 100 cap. Make the
+mod's InjectCustomTracks register only 42 customs with the music
+engine but show ALL custom tracks in the AllTracks UI list. When user
+clicks track 43+, swap a registered slot to point at the requested
+track at runtime. Effectively a paged cache. Loses state of the
+swapped-out track but keeps unlimited library. Worth considering as
+an alternative to the relocation.
+
+#### Corruption mechanism - working theory
+
+The engine's allocator `sub_1400a18a0` is the GAME-WIDE allocator
+called from thousands of places (390KB of xrefs). Cannot hook safely.
+Cleaner intercept is `sub_140c0fef0` (the constructor) called once
+with the 0x28c8 buffer.
+
+The +0x1918 pointer that crashes is written by `sub_140c14480` line
+140c14699: `*(rdi+0x1918) = sub_140ac64d0(...)`. `sub_140ac64d0`
+internally calls `sub_14268afb0(data_14a1a1020, 0, arg1, 0)` and
+returns the result. So the corruption could be either:
+
+1. `sub_14268afb0` returns garbage when arg1 is something the engine
+   can't resolve (e.g., a music context for a track that doesn't fit
+   in the 100-bucket lookup).
+2. Some other code writes garbage directly to +0x1918 (haven't found
+   such a write yet).
+
+The bucket arrays at +0x968 hold 10 x 100 uint32 IDs. With 101 OG+
+custom tracks, only 100 fit in the bucket. Track lookup queries the
+bucket; with one missing track, the lookup returns null/garbage. If
+the music engine doesn't null-check the lookup result, garbage gets
+written to +0x1918 and crashes later.
+
+Ramifications:
+
+- The 100-cap isn't really a "table cap" - it's a lookup table cap.
+- Extending requires either bigger buckets (per-bucket cap > 100) OR
+  more buckets (count > 10) OR both.
+- The bucket walks (sub_140c11fa0 etc.) use `while (i != &i[0x64])`
+  where 0x64 is element count for bucket scan (= 400 bytes of int32s).
+  Extending buckets means patching this immediate AND making each
+  bucket physically larger.
+- The 32-entry transition history at +0x22D0 is unrelated to track
+  count - it's a runtime state buffer. Doesn't need extension.
+
+Cleanest concrete attempt path:
+
+```cpp
+// Hook sub_140c0fef0 (the music engine ctor).
+// Original signature: ctor(void* buf_0x28c8) -> void* singleton.
+// Sig: 48 89 5c 24 08 48 89 74 24 10 57 48 83 ec 20 48 8b d9 bf 64 00 00 00 8b cf 33 f6 48 8d 43 08
+
+static void* __cdecl Hook_MusicCtor(void* origBuf) {
+    // 1. Allocate larger buffer (+ trailing slack for relocated tables)
+    void* big = VirtualAlloc(nullptr, 0x6000, MEM_COMMIT|MEM_RESERVE,
+                             PAGE_READWRITE);
+    if (!big) return g_origMusicCtor(origBuf); // graceful fallback
+
+    // 2. Run original constructor on our larger buffer (it inits the
+    //    standard 0x28c8 region, leaving trailing 0x3738 untouched).
+    void* ret = g_origMusicCtor(big);
+
+    // 3. Patch in-place: the cap immediates and LEAs in this same
+    //    function and the runtime walkers. Done via sig-scanned
+    //    addresses + VirtualProtect + byte writes.
+    //    Specifically:
+    //      sub_140c0fef0 +0x12: BF 64 00 00 00 -> BF C8 00 00 00 (master 200)
+    //      sub_140c0fef0 +0xDB: BA 20 00 00 00 (transition history cap, may stay)
+    //      sub_140c0fef0 +0xCD: 48 8D 8B D0 22 00 00 -> relocate to +0x4000
+    //                                                  (transition history relocated
+    //                                                   to slack, freeing +0x22D0)
+    //      sub_140c11d50 +0x24: BE 64 00 00 00 -> BE C8 00 00 00 (walk cap 200)
+    //      sub_140c11d50 +0x73: 48 8D 90 60 09 00 00 -> 48 8D 90 C0 12 00 00 (size 0x12C0 = 200*24)
+    //      sub_140c10d90: 3 slot-table walks need same cap+size patches
+    //      sub_140c12320: heavily unrolled, ~17 cap immediates - skip first pass
+    //      sub_140c11fa0: bucket cap 0x64 stays for now (only extending slot table)
+
+    // 4. (Optional) Free the orig buf - but we don't know the right
+    //    deallocator. Leak it for now (10440 bytes, one-time cost).
+    return ret;
+}
+```
+
+Risks for the first attempt:
+
+- Sub_140c12320 is heavy unrolled with ~17 0x64 caps; if NOT patched,
+  it'll continue treating the slot table as 100-entry and will skip
+  rows 100-199. That's tolerable for read but BAD if it does writes.
+- The first table at +0x000 also has a 100-cap (uses the same master
+  0x64 in ctor). Patching master to 200 also extends THAT table -
+  which would then write past +0x960 into bucket region (bucket
+  region gets memset right after, so first-table extension is wiped).
+  Net effect: first table effectively only has 100 entries even if we
+  ask for 200. Probably fine since the first table isn't directly
+  involved in the crash mechanism.
+- Bucket arrays stay at 100/bucket. If the 101st track lookup goes to
+  buckets, it still won't find the track and returns garbage. So
+  extending JUST the slot table might not actually fix the crash.
+- The bucket lookup needs separate attention. We may need to extend
+  bucket count (10 -> 20+) or per-bucket size (100 -> 200) too.
+
+Verdict: even the minimal viable attempt has multiple correlated
+patches with uncertain side effects. Each iteration needs in-game
+testing because the bug only manifests after a few bank loads.
 
 Failed attempts that got recorded so they don't get retried:
 
