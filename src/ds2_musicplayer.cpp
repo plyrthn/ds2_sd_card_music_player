@@ -5407,6 +5407,58 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
     }, nullptr, 0, nullptr);
 
+    // quit watchdog: when the user clicks Quit, the engine starts tearing
+    // down audio. Decima/Wwise has a known crash here where a callback
+    // fires on a freed object - the AV happens, the game's SEH eats it,
+    // but the shutdown thread is dead and the process never exits. The
+    // window's message pump dies along with the thread, so IsHungAppWindow
+    // flips true within 5s. We poll every 2s and force-exit after 30s of
+    // sustained hang. The watcher waits up to 60s after launch for the
+    // main window to come up before it starts polling, so it can't false-
+    // positive during normal startup.
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        HWND mainHwnd = nullptr;
+        DWORD ourPid = GetCurrentProcessId();
+        for (int tries = 0; tries < 60 && !mainHwnd; tries++) {
+            Sleep(1000);
+            struct EnumCtx { DWORD pid; HWND found; };
+            EnumCtx ctx = { ourPid, nullptr };
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                EnumCtx* c = (EnumCtx*)lp;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid == c->pid && IsWindowVisible(h) && GetWindow(h, GW_OWNER) == nullptr) {
+                    c->found = h;
+                    return FALSE;
+                }
+                return TRUE;
+            }, (LPARAM)&ctx);
+            mainHwnd = ctx.found;
+        }
+        if (!mainHwnd) return 0;
+        int hungStreak = 0;
+        for (;;) {
+            Sleep(2000);
+            if (IsHungAppWindow(mainHwnd)) {
+                hungStreak++;
+                if (hungStreak == 3) {
+                    Log("[MUSICMOD] [quitkill] main window unresponsive (~6s)\n");
+                    if (g_log) fflush(g_log);
+                }
+                if (hungStreak >= 15) {
+                    Log("[MUSICMOD] [quitkill] hung %ds, force-exiting (likely zombie quit)\n",
+                        hungStreak * 2);
+                    if (g_log) fflush(g_log);
+                    TerminateProcess(GetCurrentProcess(), 0);
+                    return 0;
+                }
+            } else {
+                hungStreak = 0;
+            }
+        }
+        return 0;
+    }, nullptr, 0, nullptr);
+
     Log("[MUSICMOD] DS2 Custom Music Player Mod\n");
     Log("[MUSICMOD] game dir: %s\n", g_gameDir);
 
