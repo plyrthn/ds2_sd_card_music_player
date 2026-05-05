@@ -34,10 +34,8 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Killing DS2.exe and crs-video.exe so the .asi isn't locked...
-taskkill /F /IM DS2.exe         >nul 2>&1
-taskkill /F /IM crs-video.exe   >nul 2>&1
-taskkill /F /IM crs-handler.exe >nul 2>&1
+echo Killing DS2.exe so the .asi isn't locked...
+taskkill /F /IM DS2.exe >nul 2>&1
 :: brief wait for the OS to release file locks
 ping -n 2 127.0.0.1 >nul
 
